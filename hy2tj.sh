@@ -169,12 +169,13 @@ node_block() {
   echo "  server: ${host}"
   echo "  port: ${PORT}"
   if [ "${HOP:-0}" = "1" ]; then
-    echo "  ports: ${PORT},${HOP_START}-${HOP_END}"
+    echo "  mport: ${PORT},${HOP_START}-${HOP_END}"
   fi
   echo "  password: ${AUTH}"
   echo "  sni: ${SNI}"
   echo "  skip-cert-verify: ${skip}"
   echo "  obfs: gecko"
+  echo "  insecure: 1"
   echo "  obfs-password: ${OBFS}"
   echo "  up: ${UP} mbps"
   echo "  down: ${DOWN} mbps"
