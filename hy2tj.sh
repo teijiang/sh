@@ -55,20 +55,17 @@ urlencode() {
 randpw() {
   openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 20
 }
-
 detect_ip() {
-  local v4 v6
-  v4="$(curl -4 -fsSL --max-time 8 https://api.ipify.org || true)"
-  v6="$(curl -6 -fsSL --max-time 8 https://api64.ipify.org || true)"
-  if [ -n "$v4" ]; then
-    IP="$v4"
-  elif [ -n "$v6" ]; then
-    IP="[$v6]"
-  else
+  IP4="$(curl -4 -fsSL --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  IP6="$(curl -6 -fsSL --max-time 8 https://api64.ipify.org 2>/dev/null || true)"
+  if [ -z "$IP4" ] && [ -z "$IP6" ]; then
     echo "没有取到公网 IP"
     exit 1
   fi
+  IP="${IP4:-$IP6}"
+  [ "${CERT_MODE:-}" = "acme" ] && IP="$DOMAIN"
 }
+
 
 load_meta() {
   [ -f "$META" ] || { echo "还没有安装"; exit 1; }
@@ -85,6 +82,9 @@ OBFS=${OBFS}
 UP=${UP}
 DOWN=${DOWN}
 IP=${IP}
+IP4=${IP4:-}
+IP6=${IP6:-}
+IPV6_ON=${IPV6_ON:-1}
 SNI=${SNI}
 CERT_MODE=${CERT_MODE}
 DOMAIN=${DOMAIN:-}
@@ -129,7 +129,8 @@ EOF
 }
 
 write_config() {
-  local tls_block
+  local listen_addr=":${PORT}"
+  [ "${IPV6_ON:-1}" = "0" ] && listen_addr="0.0.0.0:${PORT}"
   if [ "$CERT_MODE" = "acme" ]; then
     tls_block="acme:
   domains:
@@ -160,31 +161,103 @@ bandwidth:
   down: ${DOWN} mbps
 EOF
 }
+node_block() {
+  local name="$1" host="$2" skip="false"
+  [ "$CERT_MODE" = "self" ] && skip="true"
+  echo "- name: ${name}"
+  echo "  type: hysteria2"
+  echo "  server: ${host}"
+  echo "  port: ${PORT}"
+  if [ "${HOP:-0}" = "1" ]; then
+    echo "  ports: ${PORT},${HOP_START}-${HOP_END}"
+  fi
+  echo "  password: ${AUTH}"
+  echo "  sni: ${SNI}"
+  echo "  skip-cert-verify: ${skip}"
+  echo "  obfs: gecko"
+  echo "  obfs-password: ${OBFS}"
+  echo "  up: ${UP} mbps"
+  echo "  down: ${DOWN} mbps"
+}
 
 write_clients() {
-  local enc_auth enc_obfs extra link bare
+  local enc_auth enc_obfs extra base main_host
   enc_auth="$(urlencode "$AUTH")"
   enc_obfs="$(urlencode "$OBFS")"
   extra=""
   [ "$CERT_MODE" = "self" ] && extra="&insecure=1"
-  if [ "${HOP:-0}" = "1" ]; then
-    extra="${extra}&mport=${PORT},${HOP_START}-${HOP_END}"
+  [ "${HOP:-0}" = "1" ] && extra="${extra}&mport=${PORT},${HOP_START}-${HOP_END}"
+  base="obfs=gecko&obfs-password=${enc_obfs}&sni=${SNI}${extra}"
+
+  HAS_V6=0
+  if [ "$CERT_MODE" = "acme" ]; then
+    main_host="$DOMAIN"
+  elif [ -n "${IP4:-}" ]; then
+    main_host="$IP4"
+    [ "${IPV6_ON:-1}" = "1" ] && [ -n "${IP6:-}" ] && HAS_V6=1
+  else
+    main_host="[${IP6}]"
   fi
-  link="hysteria2://${enc_auth}@${IP}:${PORT}/?obfs=gecko&obfs-password=${enc_obfs}&sni=${SNI}${extra}#HY2-Gecko"
-  echo "$link" > "$BASE/neko.txt"
-  qrencode -o "$BASE/hy2.png" "$link"
-  bare="${IP//[\[\]]/}"
+
+  echo "hysteria2://${enc_auth}@${main_host}:${PORT}/?${base}#HY2-Gecko" > "$BASE/neko.txt"
+  qrencode -o "$BASE/hy2.png" "$(cat "$BASE/neko.txt")"
+
+  if [ "$HAS_V6" = "1" ]; then
+    echo "hysteria2://${enc_auth}@[${IP6}]:${PORT}/?${base}#HY2-Gecko-v6" > "$BASE/neko6.txt"
+    qrencode -o "$BASE/hy2-v6.png" "$(cat "$BASE/neko6.txt")"
+  else
+    rm -f "$BASE/neko6.txt" "$BASE/hy2-v6.png"
+  fi
+
+  local main_bare="${main_host//[\[\]]/}" names
+  names="      - HY2-Gecko"
+  [ "$HAS_V6" = "1" ] && names="${names}
+      - HY2-Gecko-v6"
+
   cat > "$BASE/clash-mate.yaml" <<EOF
 proxies:
-  - name: HY2-Gecko
-    type: hysteria2
-    server: ${bare}
-    port: ${PORT}
-    password: ${AUTH}
-    sni: ${SNI}
-    skip-cert-verify: $([ "$CERT_MODE" = "self" ] && echo true || echo false)
-    obfs: gecko
-    obfs-password: ${OBFS}
+$(node_block HY2-Gecko "$main_bare" | sed 's/^/  /')
+$([ "$HAS_V6" = "1" ] && node_block HY2-Gecko-v6 "$IP6" | sed 's/^/  /')
+EOF
+
+  cat > "$BASE/flclash.yaml" <<EOF
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: $([ "$HAS_V6" = "1" ] && echo true || echo false)
+unified-delay: true
+tcp-concurrent: true
+
+dns:
+  enable: true
+  ipv6: $([ "$HAS_V6" = "1" ] && echo true || echo false)
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  nameserver:
+    - https://dns.google/dns-query
+    - https://1.1.1.1/dns-query
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+proxies:
+$(node_block HY2-Gecko "$main_bare" | sed 's/^/  /')
+$([ "$HAS_V6" = "1" ] && node_block HY2-Gecko-v6 "$IP6" | sed 's/^/  /')
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+${names}
+      - DIRECT
+
+rules:
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - MATCH,PROXY
 EOF
 }
 
@@ -196,20 +269,52 @@ restart_svc() {
 
 show_info() {
   load_meta
-  echo "地址: $IP"
+  echo "========== 节点信息 =========="
+  echo "IPv4: ${IP4:-无}"
+  echo "IPv6: ${IP6:-无}  (IPv6 $([ "${IPV6_ON:-1}" = "1" ] && echo 已开启 || echo 已关闭))"
   echo "端口: $PORT"
-  echo "认证密码: $AUTH"
-  echo "Gecko 密码: $OBFS"
-  echo "证书: $CERT_MODE  SNI: $SNI"
+  [ "${HOP:-0}" = "1" ] && echo "端口跳跃: ${HOP_START}-${HOP_END}"
   echo
-  echo "节点链接:"
+  echo "---------- IPv4 / 主节点 ----------"
+  node_block HY2-Gecko "${IP4:-$IP6}"
+  echo
   cat "$BASE/neko.txt"
   echo
   qrencode -t ANSIUTF8 < "$BASE/neko.txt" || true
+  if [ -f "$BASE/neko6.txt" ]; then
+    echo
+    echo "---------- IPv6 节点 ----------"
+    node_block HY2-Gecko-v6 "$IP6"
+    echo
+    cat "$BASE/neko6.txt"
+    echo
+    qrencode -t ANSIUTF8 < "$BASE/neko6.txt" || true
+  fi
   echo
-  echo "二维码图片: $BASE/hy2.png"
   echo "Clash Party: $BASE/clash-mate.yaml"
-  echo "配置: $CFG"
+  echo "FlClash: $BASE/flclash.yaml"
+}
+
+toggle_ipv6() {
+  load_meta
+  detect_ip
+  echo "IPv4: ${IP4:-无}"
+  echo "IPv6: ${IP6:-无}"
+  [ -z "$IP6" ] && echo "本机没有公网 IPv6，开启后也不会生成 IPv6 节点"
+  echo "当前: $([ "${IPV6_ON:-1}" = "1" ] && echo 开启 || echo 关闭)"
+  echo "1 开启  2 关闭"
+  read -r -p "选择: " op
+  case "$op" in
+    1) IPV6_ON=1 ;;
+    2) IPV6_ON=0 ;;
+    *) echo "已取消"; exit 0 ;;
+  esac
+  save_meta
+  write_config
+  write_clients
+  apply_hop
+  restart_svc
+  show_info
 }
 
 make_self_cert() {
@@ -233,6 +338,8 @@ apply_hop() {
 #!/bin/bash
 iptables -t nat -C PREROUTING -i ${iface} -p udp --dport ${HOP_START}:${HOP_END} -j DNAT --to-destination :${PORT} 2>/dev/null \
   || iptables -t nat -A PREROUTING -i ${iface} -p udp --dport ${HOP_START}:${HOP_END} -j DNAT --to-destination :${PORT}
+ip6tables -t nat -C PREROUTING -i ${iface} -p udp --dport ${HOP_START}:${HOP_END} -j DNAT --to-destination :${PORT} 2>/dev/null \
+  || ip6tables -t nat -A PREROUTING -i ${iface} -p udp --dport ${HOP_START}:${HOP_END} -j DNAT --to-destination :${PORT} 2>/dev/null || true
 EOF
   chmod +x "$BASE/ipppp.sh"
   cat > /etc/systemd/system/ipppp.service <<EOF
@@ -258,6 +365,10 @@ install_hysteria() {
   fi
   need_pkgs
   detect_ip
+  echo "检测到 IPv4: ${IP4:-无}"
+  echo "检测到 IPv6: ${IP6:-无}"
+  read -r -p "启用 IPv6 监听和 IPv6 节点? [Y/n]: " in_v6
+  if [ "$in_v6" = "n" ] || [ "$in_v6" = "N" ]; then IPV6_ON=0; else IPV6_ON=1; fi
   download_bin
 
   local in_port in_auth in_obfs in_up in_down in_sni in_ip in_cert in_hop
@@ -284,7 +395,7 @@ install_hysteria() {
   DOWN="${in_down:-200}"
 
   read -r -p "服务器地址 [自动检测: $IP]: " in_ip
-  [ -n "$in_ip" ] && IP="$in_ip"
+  [ -n "$in_ip" ] && { IP="$in_ip"; IP4="$in_ip"; }
 
   read -r -p "证书类型 1=自签 2=ACME域名 [1]: " in_cert
   in_cert="${in_cert:-1}"
@@ -491,6 +602,7 @@ change_hop() {
 
   if [ "$old_hop" = "1" ]; then
     iptables -t nat -D PREROUTING -i "$old_iface" -p udp --dport "${old_start}:${old_end}" -j DNAT --to-destination ":${old_port}" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -i "$old_iface" -p udp --dport "${old_start}:${old_end}" -j DNAT --to-destination ":${old_port}" 2>/dev/null || true
   fi
 
   save_meta
@@ -567,6 +679,7 @@ while true; do
   echo "11 重置认证密码和 Gecko 密码"
   echo "12 重新检测公网 IP"
   echo "13 切换自签 / ACME 证书"
+  echo "14 IPv6 开关和地址"
   read -r -p "选择: " choice
 
   case "$choice" in
@@ -583,6 +696,7 @@ while true; do
     11) ( reset_pass ) ;;
     12) ( refresh_ip ) ;;
     13) ( switch_cert ) ;;
+    14) ( toggle_ipv6 ) ;;
     *)  echo "无效选项" ;;
   esac
 
