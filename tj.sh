@@ -1,6 +1,5 @@
 #!/bin/bash
 # 铁酱脚本的入口菜单。
-# 用法: curl -fL https://raw.githubusercontent.com/teijiang/sh/main/tj.sh -o tj.sh && bash tj.sh
 
 # 各脚本版本。
 #ver cker.sh 0.1
@@ -90,8 +89,35 @@ ver_gt() {
   return 1
 }
 
+valid_script_name() {
+  case "$1" in
+    ""|.*|*"/"*|*" "*|*$'\n'*|*$'\r'*) return 1 ;;
+    *.sh) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+fetch_script() {
+  local name="$1" dest part
+  valid_script_name "$name" || { echo "脚本名非法: ${name:-空}" >&2; return 1; }
+  dest="${here%/}/$name"
+  [ "$(basename -- "$dest")" = "$name" ] || { echo "目标路径异常: $dest" >&2; return 1; }
+  [ ! -d "$dest" ] || { echo "目标是目录，拒绝覆盖: $dest" >&2; return 1; }
+  part="$(mktemp "${dest}.XXXXXX")" || { echo "mktemp 失败: $dest" >&2; return 1; }
+  if curl -fL "$BASE/$name" -o "$part" && mv -T -- "$part" "$dest"; then
+    return 0
+  fi
+  rm -f "$part"
+  echo "下载失败: $BASE/$name" >&2
+  return 1
+}
+
 self_check() {
   local f
+  valid_script_name "" && { echo "self-check: 空文件名" >&2; exit 1; }
+  valid_script_name ".partial" && { echo "self-check: .partial" >&2; exit 1; }
+  valid_script_name "cker.sh" || { echo "self-check: cker.sh" >&2; exit 1; }
+  valid_script_name "fix-debian12-13_cve-2026-99999.sh" || { echo "self-check: 长文件名" >&2; exit 1; }
   ver_gt 0.2 0.1 || { echo "self-check: 0.2 > 0.1" >&2; exit 1; }
   ver_gt 0.10 0.9 || { echo "self-check: 0.10 > 0.9" >&2; exit 1; }
   ver_gt 1.2.3 1.2 || { echo "self-check: 1.2.3 > 1.2" >&2; exit 1; }
@@ -109,16 +135,12 @@ self_check() {
 }
 
 run_one() {
-  local name="$1" path="$here/$name"
+  local name="$1" path="${here%/}/$name"
   if [ ! -f "$path" ]; then
     command -v curl >/dev/null 2>&1 || { echo "缺少 curl，且本地没有 $name" >&2; return 1; }
     [ -w "$here" ] || { echo "目录不可写，无法下载: $here" >&2; return 1; }
     echo "下载 $name ..."
-    curl -fL "$BASE/$name" -o "$path.partial" && mv "$path.partial" "$path" || {
-      rm -f "$path.partial"
-      echo "下载失败: $BASE/$name" >&2
-      return 1
-    }
+    fetch_script "$name" || return 1
   fi
   echo
   echo ">>> $name"
@@ -126,8 +148,8 @@ run_one() {
 }
 
 check_updates() {
-  local tmp name lv rv status line sorted fail=0 has_ver=0 answer
-  local -a rows outdated
+  local tmp name lv rv status line sorted fail=0 has_ver=0 answer i part
+  local -a names rows outdated loc rem
   command -v curl >/dev/null 2>&1 || { echo "缺少 curl" >&2; return 1; }
   command -v sort >/dev/null 2>&1 || { echo "缺少 sort" >&2; return 1; }
   tmp="$(mktemp)" || { echo "mktemp 失败" >&2; return 1; }
@@ -144,8 +166,15 @@ check_updates() {
     return 1
   fi
 
-  for name in "${files[@]}" tj.sh; do
-    rows+=("$(ver_of "$name" "$0") $name $(ver_of "$name" "$tmp")")
+  names=("${files[@]}" tj.sh)
+  for i in "${!names[@]}"; do
+    name="${names[$i]}"
+    valid_script_name "$name" || { echo "菜单里的脚本名非法: ${name:-空}" >&2; rm -f "$tmp"; return 1; }
+    loc[$i]="$(ver_of "$name" "$0")"
+    rem[$i]="$(ver_of "$name" "$tmp")"
+    [ -n "${loc[$i]}" ] || loc[$i]=$MIN_VER
+    [ -n "${rem[$i]}" ] || rem[$i]=$MIN_VER
+    rows+=("${loc[$i]} $i")
   done
   sorted="$(printf '%s\n' "${rows[@]}" | sort -V -s)" || {
     echo "版本排序失败" >&2
@@ -154,12 +183,11 @@ check_updates() {
   }
   echo
   echo "从最小版本号开始检查（缺省 $MIN_VER）："
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    lv="${line%% *}"
-    line="${line#* }"
-    name="${line%% *}"
-    rv="${line#* }"
+  while read -r lv i; do
+    [ -n "$i" ] || continue
+    name="${names[$i]}"
+    lv="${loc[$i]}"
+    rv="${rem[$i]}"
     if ver_gt "$rv" "$lv"; then
       status="可更新"
       outdated+=("$name")
@@ -200,11 +228,9 @@ check_updates() {
   for name in "${outdated[@]}"; do
     [ "$name" = "tj.sh" ] && continue
     echo "更新 $name ..."
-    if curl -fL "$BASE/$name" -o "$here/$name.partial" && mv "$here/$name.partial" "$here/$name"; then
+    if fetch_script "$name"; then
       echo "已更新 $name"
     else
-      rm -f "$here/$name.partial"
-      echo "更新失败: $name" >&2
       fail=1
     fi
   done
@@ -213,8 +239,9 @@ check_updates() {
     echo "有脚本更新失败，未覆盖 tj.sh。"
     return 1
   fi
-  cp "$tmp" "$here/tj.sh.partial" && mv "$here/tj.sh.partial" "$here/tj.sh" || {
-    rm -f "$here/tj.sh.partial" "$tmp"
+  part="$(mktemp "${here%/}/tj.sh.XXXXXX")" || { echo "mktemp 失败" >&2; rm -f "$tmp"; return 1; }
+  cp "$tmp" "$part" && mv -T -- "$part" "${here%/}/tj.sh" || {
+    rm -f "$part" "$tmp"
     echo "覆盖 tj.sh 失败" >&2
     return 1
   }
