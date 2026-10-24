@@ -2,6 +2,8 @@
 
 # Debian kernel switch helper.  v0.1
 # 查询可用 linux-image 内核包，输入索引安装指定版本，并可选择清理旧内核镜像和 headers（含 -common）。
+# 无参数时先选菜单：1 安装内核，2 只删除旧内核和 headers。
+# 更换内核时，脚本这次直接删除切换前正在运行的内核和 headers，不登记到开机再删。
 
 
 set -eu
@@ -406,9 +408,12 @@ remove_old_kernels() {
 
     dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
         | awk '$1 ~ /^linux-image-[0-9]/ {print $1}' \
-        | grep -vxF "$keep_running_pkg" \
         | grep -vxF "$keep_selected_pkg" \
         | sort -V > "$old_file" || true
+    if [ -n "$keep_running_pkg" ] && [ -s "$old_file" ]; then
+        grep -vxF "$keep_running_pkg" "$old_file" > "${old_file}.keep" || true
+        mv "${old_file}.keep" "$old_file"
+    fi
 
     : > "$remove_file"
     if [ -s "$old_file" ]; then
@@ -427,9 +432,12 @@ remove_old_kernels() {
         | sort -V > "$headers_file" || true
     while read -r headers_pkg; do
         is_versioned_headers "$headers_pkg" || continue
-        if headers_is_kept "$headers_pkg" "$keep_running_pkg" \
-            || headers_is_kept "$headers_pkg" "$keep_selected_pkg" \
-            || headers_is_kept "$headers_pkg" "$running_image"; then
+        if headers_is_kept "$headers_pkg" "$keep_selected_pkg"; then
+            continue
+        fi
+        if [ -n "$keep_running_pkg" ] && { \
+            headers_is_kept "$headers_pkg" "$keep_running_pkg" \
+            || headers_is_kept "$headers_pkg" "$running_image"; }; then
             continue
         fi
         printf "%s\n" "$headers_pkg" >> "$remove_file"
@@ -450,18 +458,41 @@ remove_old_kernels() {
     awk '{print "  " $0}' "$remove_file"
     echo
     echo "受保护不会删除的包:"
-    echo "  当前运行: $keep_running_pkg"
-    echo "  本次选择: $keep_selected_pkg"
+    echo "  保留: $keep_selected_pkg"
+    if [ -n "$keep_running_pkg" ] && [ "$keep_running_pkg" != "$keep_selected_pkg" ]; then
+        echo "  当前运行: $keep_running_pkg"
+    elif [ -z "$keep_running_pkg" ]; then
+        echo "  切换前正在运行的内核在删除列表里，确认后这次直接删除。"
+    fi
 
-    if confirm "是否删除上面列出的旧内核包?" "n"; then
+    if [ -z "$keep_running_pkg" ]; then
+        purge_prompt="是否现在删除上面列出的旧内核（含切换前正在运行的内核）?"
+    else
+        purge_prompt="是否删除上面列出的旧内核包?"
+    fi
+    if confirm "$purge_prompt" "n"; then
         xargs "$APT_GET" purge -y < "$remove_file"
         "$APT_GET" autoremove -y
         print_installed_kernels
         echo
-        echo "重启前请确认上面列出的已安装内核中包含你刚安装的目标内核。"
+        echo "删除完成。若列表里已经没有当前正在运行的内核，再重启就不能回到那个版本。"
     else
         echo "已跳过旧内核删除。"
     fi
+}
+
+drop_boot_purge() {
+    if [ ! -f /etc/systemd/system/cker-purge-after-reboot.service ] && [ ! -f /var/lib/cker/purge-after-reboot ]; then
+        return 0
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now cker-purge-after-reboot.service >/dev/null 2>&1 || true
+    fi
+    rm -f /etc/systemd/system/cker-purge-after-reboot.service /var/lib/cker/purge-after-reboot
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    echo "已去掉开机删除。"
 }
 
 main() {
@@ -486,6 +517,12 @@ main() {
         die "请使用 root 运行，例如: sudo sh $0"
     fi
 
+    if [ "${1:-}" = "--purge-after-reboot" ]; then
+        drop_boot_purge
+        exit 0
+    fi
+    drop_boot_purge
+
     if [ -r /etc/os-release ]; then
         . /etc/os-release
         [ "${ID:-}" = "debian" ] || echo "警告: 此脚本主要适用于 Debian。当前检测到: ${PRETTY_NAME:-unknown}"
@@ -501,6 +538,28 @@ main() {
     echo "当前运行内核: $running_release"
     echo "检测到内核类型: $flavour"
     print_installed_kernels
+
+    if [ $# -eq 0 ]; then
+        while true; do
+            echo
+            echo "1) 安装或更换内核"
+            echo "2) 删除旧内核和 headers"
+            echo "0) 退出"
+            printf "请选择: "
+            read -r choice || exit 0
+            case "$choice" in
+                0|q|Q) exit 0 ;;
+                1) break ;;
+                2)
+                    tmp_old="$(mktemp)"
+                    trap 'rm -f "$tmp_old" "$tmp_old.packages" "$tmp_old.headers"' EXIT INT TERM
+                    remove_old_kernels "$running_pkg" "$running_pkg" "$tmp_old"
+                    exit 0
+                    ;;
+                *) echo "无效选择" ;;
+            esac
+        done
+    fi
 
     echo
     if [ $# -gt 0 ]; then
@@ -561,7 +620,9 @@ main() {
 
     print_installed_kernels
 
-    if confirm "是否现在删除旧内核包（镜像和 headers）?" "n"; then
+    if [ "$running_pkg" != "$selected_pkg" ]; then
+        remove_old_kernels "" "$selected_pkg" "$tmp_old"
+    elif confirm "是否现在删除其他旧内核包（镜像和 headers）?" "n"; then
         remove_old_kernels "$running_pkg" "$selected_pkg" "$tmp_old"
     else
         echo "已跳过旧内核删除。"
