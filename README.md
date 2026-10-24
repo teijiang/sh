@@ -18,7 +18,12 @@ curl -fL https://raw.githubusercontent.com/teijiang/sh/main/hy2tj.sh -o hy2tj.sh
 curl -fL https://raw.githubusercontent.com/teijiang/sh/main/benchx.sh -o benchx.sh && bash benchx.sh
  
  --------------------------------------------------------------------------------------------------
-五、fio.sh 硬盘经典测试
+五、clear.sh 快速清理系统
+
+curl -fL https://raw.githubusercontent.com/teijiang/sh/main/clear.sh -o clear.sh && bash clear.sh
+ 
+ --------------------------------------------------------------------------------------------------
+六、fio.sh 硬盘经典测试
 
 curl -fL https://raw.githubusercontent.com/teijiang/sh/main/fio.sh -o fio.sh && bash fio.sh
  
