@@ -5,7 +5,7 @@
 
 # 各脚本版本。发布更新时改对应行。现在从最小版本 0.1 起。
 #ver cker.sh 0.1
-#ver fix-debian12-13_cve-2026-99999.sh 0.1
+#ver fix-debian12-13_cve-2026-99999.sh 0.1.1
 #ver hy2tj.sh 0.1
 #ver benchx.sh 0.1
 #ver clear.sh 0.1
