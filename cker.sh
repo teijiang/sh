@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # Debian kernel switch helper.
-# 查询可用 linux-image 内核包，输入索引安装指定版本，并可选择清理旧内核。
+# 查询可用 linux-image 内核包，输入索引安装指定版本，并可选择清理旧内核镜像和 headers（含 -common）。
 #
 # Debian 13+ 实际包名类似 linux-image-6.12.107+deb13-amd64，
 # 不存在 linux-image-6.12.x-amd64 这种占位包。版本关键字可用 6.12 或 6.12.x。
@@ -99,6 +99,77 @@ print_installed_kernels() {
 
 headers_package_for_image() {
     printf "%s\n" "$1" | sed 's/^linux-image-/linux-headers-/'
+}
+
+common_headers_for_image() {
+    hdr_release="${1#linux-image-}"
+    case "$hdr_release" in
+        *-cloud-amd64) hdr_flavour=cloud-amd64 ;;
+        *-rt-amd64) hdr_flavour=rt-amd64 ;;
+        *-cloud-arm64) hdr_flavour=cloud-arm64 ;;
+        *-rt-arm64) hdr_flavour=rt-arm64 ;;
+        *-amd64) hdr_flavour=amd64 ;;
+        *-686-pae) hdr_flavour=686-pae ;;
+        *-armmp-lpae) hdr_flavour=armmp-lpae ;;
+        *-armmp) hdr_flavour=armmp ;;
+        *-arm64) hdr_flavour=arm64 ;;
+        *-686) hdr_flavour=686 ;;
+        *) return 0 ;;
+    esac
+    hdr_abi="${hdr_release%-"$hdr_flavour"}"
+    case "$hdr_abi" in
+        [0-9]*.[0-9]*.[0-9]*) printf "linux-headers-%s-common\n" "$hdr_abi" ;;
+    esac
+}
+
+# shortcut: 不删 linux-headers-amd64 / linux-headers-6.12-amd64 这类滚动元包，kbuild 交给后面的 autoremove；这两类也要删时再加规则。
+is_versioned_headers() {
+    case "$1" in
+        linux-headers-[0-9]*.[0-9]*.[0-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+package_depends_on() {
+    dpkg-query -W -f='${Depends}\n${Pre-Depends}\n' "$1" 2>/dev/null \
+        | awk -v dep="$2" '{
+            n = split($0, parts, ",")
+            for (i = 1; i <= n; i++) {
+                gsub(/^[ \t]+|[ \t]+$/, "", parts[i])
+                split(parts[i], tok, " ")
+                if (tok[1] == dep) found = 1
+            }
+        } END { exit found ? 0 : 1 }'
+}
+
+headers_is_kept() {
+    keep_pkg="$1"
+    keep_image="$2"
+    [ -n "$keep_image" ] || return 1
+    keep_hdr="$(headers_package_for_image "$keep_image")"
+    [ "$keep_pkg" = "$keep_hdr" ] && return 0
+    keep_common="$(common_headers_for_image "$keep_image")"
+    [ -n "$keep_common" ] && [ "$keep_pkg" = "$keep_common" ] && return 0
+    if package_is_installed "$keep_hdr" && package_depends_on "$keep_hdr" "$keep_pkg"; then
+        return 0
+    fi
+    return 1
+}
+
+self_check_headers_filter() {
+    [ "$(common_headers_for_image linux-image-6.12.113+deb13-amd64)" = "linux-headers-6.12.113+deb13-common" ] \
+        || die "self-check: trixie common"
+    [ "$(common_headers_for_image linux-image-6.1.0-54-amd64)" = "linux-headers-6.1.0-54-common" ] \
+        || die "self-check: bookworm common"
+    [ "$(common_headers_for_image linux-image-6.1.0-21-cloud-amd64)" = "linux-headers-6.1.0-21-common" ] \
+        || die "self-check: cloud common"
+    [ -z "$(common_headers_for_image linux-image-6.12-amd64)" ] || die "self-check: 元包不应有 common"
+    is_versioned_headers linux-headers-6.12.113+deb13-common || die "self-check: trixie common 应删除"
+    is_versioned_headers linux-headers-6.1.0-54-amd64 || die "self-check: bookworm headers 应删除"
+    is_versioned_headers linux-headers-6.12-amd64 && die "self-check: 滚动元包不应删除"
+    is_versioned_headers linux-headers-6.1-cloud-amd64 && die "self-check: cloud 元包不应删除"
+    echo "self-check ok"
+    exit 0
 }
 
 package_is_installed() {
@@ -333,30 +404,49 @@ remove_old_kernels() {
     keep_selected_pkg="$2"
     old_file="$3"
     remove_file="${old_file}.packages"
+    headers_file="${old_file}.headers"
+    running_image="linux-image-$(uname -r)"
 
     dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
         | awk '$1 ~ /^linux-image-[0-9]/ {print $1}' \
-        | grep -vx "$keep_running_pkg" \
-        | grep -vx "$keep_selected_pkg" \
+        | grep -vxF "$keep_running_pkg" \
+        | grep -vxF "$keep_selected_pkg" \
         | sort -V > "$old_file" || true
 
-    if [ ! -s "$old_file" ]; then
-        echo
-        echo "没有找到可删除的旧内核镜像包。"
-        return 0
+    : > "$remove_file"
+    if [ -s "$old_file" ]; then
+        cat "$old_file" >> "$remove_file"
+        while read -r image_pkg; do
+            headers_pkg="$(headers_package_for_image "$image_pkg")"
+            if package_is_installed "$headers_pkg"; then
+                printf "%s\n" "$headers_pkg" >> "$remove_file"
+            fi
+        done < "$old_file"
     fi
 
-    echo
-    echo "可删除的旧内核镜像包:"
-    awk '{print "  " $0}' "$old_file"
-    : > "$remove_file"
-    while read -r image_pkg; do
-        headers_pkg="$(printf "%s\n" "$image_pkg" | sed 's/^linux-image-/linux-headers-/')"
-        printf "%s\n" "$image_pkg" >> "$remove_file"
-        if dpkg-query -W -f='${Status}' "$headers_pkg" 2>/dev/null | grep -q "install ok installed"; then
-            printf "%s\n" "$headers_pkg" >> "$remove_file"
+    # 镜像已经删掉时，旧 headers 和 -common 仍会留下，不能只跟着镜像包名找。
+    dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'linux-headers-*' 2>/dev/null \
+        | awk '$1 == "ii" || $1 == "rc" {print $2}' \
+        | sort -V > "$headers_file" || true
+    while read -r headers_pkg; do
+        is_versioned_headers "$headers_pkg" || continue
+        if headers_is_kept "$headers_pkg" "$keep_running_pkg" \
+            || headers_is_kept "$headers_pkg" "$keep_selected_pkg" \
+            || headers_is_kept "$headers_pkg" "$running_image"; then
+            continue
         fi
-    done < "$old_file"
+        printf "%s\n" "$headers_pkg" >> "$remove_file"
+    done < "$headers_file"
+
+    if [ -s "$remove_file" ]; then
+        sort -V -u -o "$remove_file" "$remove_file"
+    fi
+
+    if [ ! -s "$remove_file" ]; then
+        echo
+        echo "没有找到可删除的旧内核包。"
+        return 0
+    fi
 
     echo
     echo "将要 purge 的包:"
@@ -378,6 +468,10 @@ remove_old_kernels() {
 }
 
 main() {
+    if [ "${1:-}" = "--self-check" ]; then
+        self_check_headers_filter
+    fi
+
     need_cmd awk
     need_cmd grep
     need_cmd sort
@@ -432,7 +526,7 @@ main() {
     tmp_list="$(mktemp)"
     tmp_old="$(mktemp)"
     tmp_missing="$(mktemp)"
-    trap 'rm -f "$tmp_list" "$tmp_old" "$tmp_old.packages" "$tmp_missing"' EXIT INT TERM
+    trap 'rm -f "$tmp_list" "$tmp_old" "$tmp_old.packages" "$tmp_old.headers" "$tmp_missing"' EXIT INT TERM
 
     repair_missing_headers "$tmp_missing"
 
@@ -470,7 +564,7 @@ main() {
 
     print_installed_kernels
 
-    if confirm "是否现在删除旧内核镜像包?" "n"; then
+    if confirm "是否现在删除旧内核包（镜像和 headers）?" "n"; then
         remove_old_kernels "$running_pkg" "$selected_pkg" "$tmp_old"
     else
         echo "已跳过旧内核删除。"
@@ -480,6 +574,7 @@ main() {
     echo "完成。需要重启后才会使用新安装的内核。"
     echo "重启前建议执行以下检查:"
     echo "  dpkg-query -W -f='\${Package}\t\${Version}\n' 'linux-image-*' | sort -V"
+    echo "  dpkg-query -W -f='\${Package}\t\${Version}\n' 'linux-headers-*' | sort -V"
     echo "  grep menuentry /boot/grub/grub.cfg | grep 'Linux'"
 }
 
