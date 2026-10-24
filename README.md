@@ -1,3 +1,5 @@
+curl -fL https://raw.githubusercontent.com/teijiang/sh/main/tj.sh -o tj.sh && bash tj.sh
+
 一、cker.sh 更换debian 12&13内核
 
 curl -fL https://raw.githubusercontent.com/teijiang/sh/main/cker.sh -o cker.sh && bash cker.sh
