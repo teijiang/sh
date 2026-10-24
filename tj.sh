@@ -259,7 +259,7 @@ while true; do
   echo "======== debian12-13 tj脚本菜单 ========"
   i=1
   while [ "$i" -le "${#files[@]}" ]; do
-    printf '  %d) [v%s] %s  %s\n' "$i" "$(ver_of "${files[$((i - 1))]}")" "${files[$((i - 1))]}" "${labels[$((i - 1))]}"
+    printf '  %d)  %s  %s\n' "$i"  "${files[$((i - 1))]}" "${labels[$((i - 1))]}"
     i=$((i + 1))
   done
   echo "  999) 检查脚本更新"
