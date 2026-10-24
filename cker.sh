@@ -1,11 +1,8 @@
 #!/bin/sh
 
-# Debian kernel switch helper.
+# Debian kernel switch helper.  v0.1
 # 查询可用 linux-image 内核包，输入索引安装指定版本，并可选择清理旧内核镜像和 headers（含 -common）。
-#
-# Debian 13+ 实际包名类似 linux-image-6.12.107+deb13-amd64，
-# 不存在 linux-image-6.12.x-amd64 这种占位包。版本关键字可用 6.12 或 6.12.x。
-# 用法: ks.sh [version-filter]
+
 
 set -eu
 
