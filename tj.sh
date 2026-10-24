@@ -1,6 +1,6 @@
 #!/bin/bash
-# 六个脚本的入口菜单。
-# 用法: curl -fL https://raw.githubusercontent.com/teijiang/sh/main/menu.sh -o menu.sh && bash menu.sh
+# 铁酱脚本的入口菜单。
+# 用法: curl -fL https://raw.githubusercontent.com/teijiang/sh/main/tj.sh -o tj.sh && bash tj.sh
 # shortcut: 同目录已有文件则直接运行且不覆盖；要拉最新版先删掉对应 sh。
 
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -20,7 +20,7 @@ files=(
 )
 labels=(
   "更换 Debian 12/13 内核"
-  "更换 Debian 12/13 内核，修复漏洞"
+  "更换 Debian 12/13 内核，修复cve_2026-99999漏洞"
   "hy2 最新一键脚本，输出二维码"
   "快速测试 GB5 评分"
   "快速清理系统"
@@ -49,7 +49,7 @@ run_one() {
 
 while true; do
   echo
-  echo "======== 脚本菜单 ========"
+  echo "======== debian12-13 tj脚本菜单 ========"
   i=1
   while [ "$i" -le "${#files[@]}" ]; do
     printf '  %d) %s  %s\n' "$i" "${files[$((i - 1))]}" "${labels[$((i - 1))]}"
