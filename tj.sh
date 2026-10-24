@@ -1,7 +1,9 @@
 #!/bin/bash
 # 铁酱脚本的入口菜单。
+# 用法: curl -fL https://raw.githubusercontent.com/teijiang/sh/main/tj.sh -o tj.sh && bash tj.sh
+# shortcut: 普通菜单不覆盖已有脚本；999 确认后才覆盖。版本只认下面的 #ver，没有写的按最小版本 0.1。
 
-# 各脚本版本。
+# 各脚本版本。发布更新时改对应行。现在从最小版本 0.1 起。
 #ver cker.sh 0.1
 #ver fix-debian12-13_cve-2026-99999.sh 0.1
 #ver hy2tj.sh 0.1
@@ -135,7 +137,9 @@ self_check() {
 }
 
 run_one() {
-  local name="$1" path="${here%/}/$name"
+  local name="$1"
+  # local 同一行会先展开，$name 这时还是空的，path 会变成目录本身。
+  local path="${here%/}/$name"
   if [ ! -f "$path" ]; then
     command -v curl >/dev/null 2>&1 || { echo "缺少 curl，且本地没有 $name" >&2; return 1; }
     [ -w "$here" ] || { echo "目录不可写，无法下载: $here" >&2; return 1; }
@@ -259,7 +263,7 @@ while true; do
   echo "======== debian12-13 tj脚本菜单 ========"
   i=1
   while [ "$i" -le "${#files[@]}" ]; do
-    printf '  %d)  %s  %s\n' "$i"  "${files[$((i - 1))]}" "${labels[$((i - 1))]}"
+    printf '  %d) [v%s] %s  %s\n' "$i" "$(ver_of "${files[$((i - 1))]}")" "${files[$((i - 1))]}" "${labels[$((i - 1))]}"
     i=$((i + 1))
   done
   echo "  999) 检查脚本更新"
