@@ -2,8 +2,7 @@
 
 # Debian kernel switch helper.  v0.1
 # 查询可用 linux-image 内核包，输入索引安装指定版本，并可选择清理旧内核镜像和 headers（含 -common）。
-# 无参数时先选菜单：1 安装内核，2 只删除旧内核和 headers。
-# 更换内核时，脚本这次直接删除切换前正在运行的内核和 headers，不登记到开机再删。
+# 无参数时先选菜单：1 安装内核，2 自己选包删除并切换启动内核。
 
 
 set -eu
@@ -127,32 +126,6 @@ is_versioned_headers() {
         linux-headers-[0-9]*.[0-9]*.[0-9]*) return 0 ;;
         *) return 1 ;;
     esac
-}
-
-package_depends_on() {
-    dpkg-query -W -f='${Depends}\n${Pre-Depends}\n' "$1" 2>/dev/null \
-        | awk -v dep="$2" '{
-            n = split($0, parts, ",")
-            for (i = 1; i <= n; i++) {
-                gsub(/^[ \t]+|[ \t]+$/, "", parts[i])
-                split(parts[i], tok, " ")
-                if (tok[1] == dep) found = 1
-            }
-        } END { exit found ? 0 : 1 }'
-}
-
-headers_is_kept() {
-    keep_pkg="$1"
-    keep_image="$2"
-    [ -n "$keep_image" ] || return 1
-    keep_hdr="$(headers_package_for_image "$keep_image")"
-    [ "$keep_pkg" = "$keep_hdr" ] && return 0
-    keep_common="$(common_headers_for_image "$keep_image")"
-    [ -n "$keep_common" ] && [ "$keep_pkg" = "$keep_common" ] && return 0
-    if package_is_installed "$keep_hdr" && package_depends_on "$keep_hdr" "$keep_pkg"; then
-        return 0
-    fi
-    return 1
 }
 
 self_check_headers_filter() {
@@ -398,87 +371,172 @@ repair_missing_headers() {
     fi
 }
 
-remove_old_kernels() {
-    keep_running_pkg="$1"
-    keep_selected_pkg="$2"
-    old_file="$3"
-    remove_file="${old_file}.packages"
-    headers_file="${old_file}.headers"
-    running_image="linux-image-$(uname -r)"
-
-    dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null \
-        | awk '$1 ~ /^linux-image-[0-9]/ {print $1}' \
-        | grep -vxF "$keep_selected_pkg" \
-        | sort -V > "$old_file" || true
-    if [ -n "$keep_running_pkg" ] && [ -s "$old_file" ]; then
-        grep -vxF "$keep_running_pkg" "$old_file" > "${old_file}.keep" || true
-        mv "${old_file}.keep" "$old_file"
+choose_purge() {
+    list_file="$1"
+    chosen_file="$2"
+    dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'linux-image-*' 'linux-headers-*' 2>/dev/null \
+        | awk '($1 == "ii" || $1 == "rc") && ($2 ~ /^linux-image-[0-9]/ || $2 ~ /^linux-headers-[0-9]/) {print $2}' \
+        | sort -V -u > "$list_file" || true
+    if [ ! -s "$list_file" ]; then
+        echo "没有已安装的内核包。"
+        return 1
     fi
 
-    : > "$remove_file"
-    if [ -s "$old_file" ]; then
-        cat "$old_file" >> "$remove_file"
-        while read -r image_pkg; do
-            headers_pkg="$(headers_package_for_image "$image_pkg")"
-            if package_is_installed "$headers_pkg"; then
-                printf "%s\n" "$headers_pkg" >> "$remove_file"
-            fi
-        done < "$old_file"
+    echo
+    echo "已安装的内核包。输入编号删除，多个用空格或逗号，直接回车取消:"
+    awk -v run="$(uname -r)" '{
+        mark = index($0, run) ? "  <-- 当前内核" : ""
+        printf "  [%d] %s%s\n", NR, $0, mark
+    }' "$list_file"
+    printf "删除哪些: "
+    read -r picks || return 1
+    if [ -z "$picks" ]; then
+        echo "已取消。"
+        return 1
     fi
 
-    # 镜像已经删掉时，旧 headers 和 -common 仍会留下，不能只跟着镜像包名找。
-    dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'linux-headers-*' 2>/dev/null \
-        | awk '$1 == "ii" || $1 == "rc" {print $2}' \
-        | sort -V > "$headers_file" || true
-    while read -r headers_pkg; do
-        is_versioned_headers "$headers_pkg" || continue
-        if headers_is_kept "$headers_pkg" "$keep_selected_pkg"; then
-            continue
-        fi
-        if [ -n "$keep_running_pkg" ] && { \
-            headers_is_kept "$headers_pkg" "$keep_running_pkg" \
-            || headers_is_kept "$headers_pkg" "$running_image"; }; then
-            continue
-        fi
-        printf "%s\n" "$headers_pkg" >> "$remove_file"
-    done < "$headers_file"
-
-    if [ -s "$remove_file" ]; then
-        sort -V -u -o "$remove_file" "$remove_file"
-    fi
-
-    if [ ! -s "$remove_file" ]; then
-        echo
-        echo "没有找到可删除的旧内核包。"
-        return 0
+    picks="$(printf '%s\n' "$picks" | tr ',' ' ')"
+    : > "$chosen_file"
+    for n in $picks; do
+        case "$n" in
+            ""|*[!0-9]*)
+                echo "无效编号: $n" >&2
+                return 1
+                ;;
+        esac
+        pkg="$(awk -v n="$n" 'NR == n {print; found=1} END {exit found ? 0 : 1}' "$list_file")" || {
+            echo "编号超出范围: $n" >&2
+            return 1
+        }
+        printf '%s\n' "$pkg" >> "$chosen_file"
+    done
+    sort -u -o "$chosen_file" "$chosen_file"
+    if [ ! -s "$chosen_file" ]; then
+        echo "没有选中任何包。"
+        return 1
     fi
 
     echo
     echo "将要 purge 的包:"
-    awk '{print "  " $0}' "$remove_file"
-    echo
-    echo "受保护不会删除的包:"
-    echo "  保留: $keep_selected_pkg"
-    if [ -n "$keep_running_pkg" ] && [ "$keep_running_pkg" != "$keep_selected_pkg" ]; then
-        echo "  当前运行: $keep_running_pkg"
-    elif [ -z "$keep_running_pkg" ]; then
-        echo "  切换前正在运行的内核在删除列表里，确认后这次直接删除。"
+    awk '{print "  " $0}' "$chosen_file"
+    running_image="linux-image-$(uname -r)"
+    if grep -qxF "$running_image" "$chosen_file"; then
+        echo "包含当前正在运行的内核。删掉后这次还能跑，再重启就不能回到这个版本。"
+    fi
+    confirm "确认删除上面这些包?" "n" || {
+        echo "已取消。"
+        return 1
+    }
+    if ! xargs "$APT_GET" purge -y < "$chosen_file"; then
+        echo "删除失败。" >&2
+        return 1
+    fi
+    "$APT_GET" autoremove -y || true
+    echo "删除完成。"
+}
+
+grub_entry_for() {
+    rel="$1"
+    cfg="$2"
+    awk -v rel="$rel" '
+        function title(line,   q, n, a, i, dq) {
+            q = sprintf("%c", 39)
+            i = index(line, q)
+            dq = index(line, "\"")
+            if (i && (dq == 0 || i < dq)) {
+                n = split(line, a, q)
+                return a[2]
+            }
+            n = split(line, a, "\"")
+            return a[2]
+        }
+        /^submenu[[:space:]]/ { subm = title($0); next }
+        /^menuentry[[:space:]]/ { subm = ""; }
+        /^[[:space:]]*menuentry[[:space:]]/ {
+            t = title($0)
+            if (t != "" && index(t, rel)) {
+                if (subm != "" && $0 ~ /^[[:space:]]/) print subm ">" t
+                else print t
+                exit
+            }
+        }
+    ' "$cfg"
+}
+
+switch_boot_kernel() {
+    list_file="$1"
+    dpkg-query -W -f='${db:Status-Abbrev}\t${Package}\n' 'linux-image-*' 2>/dev/null \
+        | awk '$1 == "ii" && $2 ~ /^linux-image-[0-9]/ && $2 !~ /-unsigned$/ && $2 !~ /-dbg$/ {print $2}' \
+        | sort -V > "$list_file" || true
+    if [ ! -s "$list_file" ]; then
+        echo "没有可切换的已安装内核。"
+        return 1
     fi
 
-    if [ -z "$keep_running_pkg" ]; then
-        purge_prompt="是否现在删除上面列出的旧内核（含切换前正在运行的内核）?"
-    else
-        purge_prompt="是否删除上面列出的旧内核包?"
+    echo
+    echo "切换下次启动到哪个内核:"
+    awk -v run="linux-image-$(uname -r)" '{
+        mark = ($0 == run) ? "  <-- 正在运行" : ""
+        printf "  [%d] %s%s\n", NR, $0, mark
+    }' "$list_file"
+    printf "请输入编号，直接回车不切换: "
+    read -r index || return 1
+    if [ -z "$index" ]; then
+        echo "未切换启动项。"
+        return 0
     fi
-    if confirm "$purge_prompt" "n"; then
-        xargs "$APT_GET" purge -y < "$remove_file"
-        "$APT_GET" autoremove -y
-        print_installed_kernels
-        echo
-        echo "删除完成。若列表里已经没有当前正在运行的内核，再重启就不能回到那个版本。"
-    else
-        echo "已跳过旧内核删除。"
+    case "$index" in
+        *[!0-9]*)
+            echo "请输入数字编号。" >&2
+            return 1
+            ;;
+    esac
+    boot_pkg="$(awk -v n="$index" 'NR == n {print; found=1} END {exit found ? 0 : 1}' "$list_file")" || {
+        echo "编号超出范围。" >&2
+        return 1
+    }
+
+    release="${boot_pkg#linux-image-}"
+    cfg=/boot/grub/grub.cfg
+    if [ ! -f "$cfg" ]; then
+        echo "没有 $cfg，无法切换启动项。" >&2
+        return 1
     fi
+    entry="$(grub_entry_for "$release" "$cfg" || true)"
+    if [ -z "$entry" ] && command -v update-grub >/dev/null 2>&1; then
+        echo "GRUB 菜单里还没有 $release，正在更新菜单..."
+        update-grub
+        entry="$(grub_entry_for "$release" "$cfg" || true)"
+    fi
+    if [ -z "$entry" ]; then
+        echo "GRUB 菜单里没有找到 $release，没有改默认启动项。" >&2
+        return 1
+    fi
+    if [ ! -f /etc/default/grub ]; then
+        echo "没有 /etc/default/grub，无法设置默认启动项。" >&2
+        return 1
+    fi
+    awk -v entry="$entry" '
+        BEGIN { found = 0 }
+        /^GRUB_DEFAULT=/ {
+            gsub(/"/, "\\\\"", entry)
+            print "GRUB_DEFAULT=\"" entry "\""
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (!found) {
+                gsub(/"/, "\\\\"", entry)
+                print "GRUB_DEFAULT=\"" entry "\""
+            }
+        }
+    ' /etc/default/grub > /etc/default/grub.cker.tmp
+    mv /etc/default/grub.cker.tmp /etc/default/grub
+    if command -v update-grub >/dev/null 2>&1; then
+        update-grub
+    fi
+    echo "下次启动将使用: $entry"
 }
 
 drop_boot_purge() {
@@ -543,7 +601,7 @@ main() {
         while true; do
             echo
             echo "1) 安装或更换内核"
-            echo "2) 删除旧内核和 headers"
+            echo "2) 选择删除内核包，并切换启动内核"
             echo "0) 退出"
             printf "请选择: "
             read -r choice || exit 0
@@ -552,8 +610,10 @@ main() {
                 1) break ;;
                 2)
                     tmp_old="$(mktemp)"
-                    trap 'rm -f "$tmp_old" "$tmp_old.packages" "$tmp_old.headers"' EXIT INT TERM
-                    remove_old_kernels "$running_pkg" "$running_pkg" "$tmp_old"
+                    trap 'rm -f "$tmp_old" "$tmp_old.chosen"' EXIT INT TERM
+                    if choose_purge "$tmp_old" "$tmp_old.chosen"; then
+                        switch_boot_kernel "$tmp_old"
+                    fi
                     exit 0
                     ;;
                 *) echo "无效选择" ;;
@@ -582,7 +642,7 @@ main() {
     tmp_list="$(mktemp)"
     tmp_old="$(mktemp)"
     tmp_missing="$(mktemp)"
-    trap 'rm -f "$tmp_list" "$tmp_old" "$tmp_old.packages" "$tmp_old.headers" "$tmp_missing"' EXIT INT TERM
+    trap 'rm -f "$tmp_list" "$tmp_old" "$tmp_old.chosen" "$tmp_missing"' EXIT INT TERM
 
     repair_missing_headers "$tmp_missing"
 
@@ -620,12 +680,10 @@ main() {
 
     print_installed_kernels
 
-    if [ "$running_pkg" != "$selected_pkg" ]; then
-        remove_old_kernels "" "$selected_pkg" "$tmp_old"
-    elif confirm "是否现在删除其他旧内核包（镜像和 headers）?" "n"; then
-        remove_old_kernels "$running_pkg" "$selected_pkg" "$tmp_old"
-    else
-        echo "已跳过旧内核删除。"
+    echo
+    echo "可以自己选要删除的包，直接回车跳过。"
+    if choose_purge "$tmp_old" "$tmp_old.chosen"; then
+        switch_boot_kernel "$tmp_old"
     fi
 
     echo
