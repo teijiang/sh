@@ -1,10 +1,11 @@
 #!/bin/bash
-# VPS 性能快速检测脚本 v0.1
+# VPS 性能快速检测脚本 v0.2
 # by tj 机组(teijiang,远古巨瘦,钻舰队长,鸡贼王，石巨人,牛头人)带领claude、dp3出品
+# CPU 项改为 cpubench（Go）。综合指数是五项 ops/s 的几何平均，不是 GB5；拿到对照机器后再校准。
 
-echo -e "\033[1;34m===== 站长 VPS 性能快速检测 v0.1 =====\033[0m"
-echo "专注检测：IO性能、CPU稳定性、内存带宽、网络延迟、超售程度"
-echo "预计耗时：60秒"
+echo -e "\033[1;34m===== 站长 VPS 性能快速检测 v0.2 =====\033[0m"
+echo "专注检测：IO性能、CPU（cpubench）、内存带宽、超售程度"
+echo "预计耗时：约 90 秒（CPU 默认 3 次取中位数；首次会下载 Go 工具链）"
  
 # 全局变量
 declare -gi DISK_IOPS=0
@@ -12,10 +13,14 @@ declare -gi MEMORY_BANDWIDTH=0
 declare -gi CPU_SINGLE_SCORE=0
 declare -gi CPU_MULTI_SCORE=0
 declare -g NETWORK_LATENCY="0"
-declare -gi BZIP2_SPEED=0
-declare -gi SHA256_SPEED=0
-declare -gi MD5SUM_SPEED=0
 declare -g actual_efficiency=0
+declare -g CPU_SCALE="0"
+declare -g STEAL_PCT="0"
+declare -gi CPU_BENCH_OK=0
+# 每项时长和重复次数。例：CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh
+declare -g CPU_BENCH_DURATION="${CPU_BENCH_DURATION:-1s}"
+declare -gi CPU_BENCH_REPS="${CPU_BENCH_REPS:-3}"
+declare -g GO_TOOLCHAIN="${GO_TOOLCHAIN:-go1.22.10}"
 declare -g DISK_IOPS_STR="0"    # 字符串存储综合评分
 declare -g read_iops_formatted="0"   # 字符串存储原始IOPS值
 declare -g write_bw_formatted="0"    # 字符串存储原始带宽值
@@ -26,8 +31,8 @@ install_tools() {
     command -v fio &>/dev/null || tools_needed="$tools_needed fio"
     command -v sysbench &>/dev/null || tools_needed="$tools_needed sysbench"
     command -v bc &>/dev/null || tools_needed="$tools_needed bc"
-    command -v bzip2 &>/dev/null || tools_needed="$tools_needed bzip2"
     command -v jq &>/dev/null || tools_needed="$tools_needed jq"
+    command -v curl &>/dev/null || tools_needed="$tools_needed curl"
     
     if [[ -n "$tools_needed" ]]; then
         echo "安装必要工具: $tools_needed"
@@ -60,91 +65,124 @@ float_compare() {
     echo "$val1 $op $val2" | bc -l 2>/dev/null || echo 0
 } 
  
-run_cpu_benchmarks() {
-    echo "运行CPU性能基准测试（bzip2/SHA256/MD5）..."
-    
-    # 创建100MB测试文件
-    local test_file="/tmp/cpu_bench_test.dat"
-    echo "生成cpu_bench_100mb测试文件..."
-    dd if=/dev/zero of="$test_file" bs=512K count=200 >/dev/null 2>&1
-    
-    # bzip2压缩测试 
-    local start_time=$(date +%s%N)
-    bzip2 -c "$test_file" > /tmp/test.bz2 2>/dev/null
-    local end_time=$(date +%s%N)
-    local bzip2_time_ms=$(( (end_time - start_time) / 1000000 ))
-    BZIP2_SPEED=$(( 100000 / bzip2_time_ms ))  # 改为纯Bash整数运算
-    [[ $BZIP2_SPEED -le 0 ]] && BZIP2_SPEED=1
-    echo "  bzip2压缩测试...$BZIP2_SPEED"
-    # SHA256哈希测试
-    start_time=$(date +%s%N)
-    sha256sum "$test_file" >/dev/null 2>&1
-    end_time=$(date +%s%N)
-    local sha256_time_ms=$(( (end_time - start_time) / 1000000 ))
-    SHA256_SPEED=$(( 100000 / sha256_time_ms ))  # 改为纯Bash整数运算
-    [[ $SHA256_SPEED -le 0 ]] && SHA256_SPEED=1
-    
-    echo "  SHA256哈希测试...$SHA256_SPEED"
-    # MD5哈希测试
-    start_time=$(date +%s%N)
-    md5sum "$test_file" >/dev/null 2>&1
-    end_time=$(date +%s%N)
-    local md5_time_ms=$(( (end_time - start_time) / 1000000 ))
-    MD5SUM_SPEED=$(( 100000 / md5_time_ms ))  # 改为纯Bash整数运算
-    [[ $MD5SUM_SPEED -le 0 ]] && MD5SUM_SPEED=1
-    
-    echo "  MD5哈希测试...$MD5SUM_SPEED"
-    # 清理临时文件
-    rm -f "$test_file" /tmp/test.bz2 2>/dev/null
+# 优先用脚本同目录的 cpubench.go，否则从本文件末尾的嵌入副本抽出。
+ensure_go() {
+    local arch tar root url tmp unpack download_ok
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *)
+            echo "不支持的 CPU 架构: $(uname -m)"
+            return 1
+            ;;
+    esac
+
+    export GOTOOLCHAIN=local
+    for root in "/opt/${GO_TOOLCHAIN}" "${HOME:-/tmp}/.${GO_TOOLCHAIN}"; do
+        if [[ -x "${root}/bin/go" ]]; then
+            export GOROOT="$root"
+            export PATH="${root}/bin:${PATH}"
+            hash -r
+            return 0
+        fi
+    done
+
+    if command -v go >/dev/null 2>&1 && go version 2>/dev/null | grep -q "${GO_TOOLCHAIN} "; then
+        return 0
+    fi
+
+    root="${HOME:-/tmp}/.${GO_TOOLCHAIN}"
+    if mkdir -p /opt >/dev/null 2>&1 && [[ -w /opt ]]; then
+        root="/opt/${GO_TOOLCHAIN}"
+    fi
+
+    tar="${GO_TOOLCHAIN}.linux-${arch}.tar.gz"
+    tmp="/tmp/${tar}"
+    echo "下载固定 Go 工具链 ${GO_TOOLCHAIN}（各机器必须同版本才能比分数）..."
+    download_ok=0
+    for url in \
+        "https://mirrors.aliyun.com/golang/${tar}" \
+        "https://mirrors.cloud.tencent.com/go/${tar}" \
+        "https://go.dev/dl/${tar}"
+    do
+        echo "  尝试 ${url}"
+        rm -f "$tmp"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fL --retry 2 --connect-timeout 20 -o "$tmp" "$url" && download_ok=1 && break
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -O "$tmp" "$url" && download_ok=1 && break
+        else
+            echo "没有 curl 或 wget，无法下载 Go"
+            break
+        fi
+    done
+    if [[ "$download_ok" -ne 1 ]]; then
+        if command -v go >/dev/null 2>&1; then
+            echo "工具链下载失败，改用系统 Go：$(go version 2>/dev/null)。换机器对比时分数可能不可比。"
+            return 0
+        fi
+        echo "无法下载 ${GO_TOOLCHAIN}，也没有系统 Go。"
+        return 1
+    fi
+
+    unpack="/tmp/${GO_TOOLCHAIN}-unpack"
+    rm -rf "$unpack" "$root"
+    mkdir -p "$unpack" || return 1
+    tar -C "$unpack" -xzf "$tmp" || return 1
+    mkdir -p "$(dirname "$root")" || return 1
+    mv "$unpack/go" "$root" || return 1
+    rm -rf "$unpack" "$tmp"
+    export GOROOT="$root"
+    export PATH="${root}/bin:${PATH}"
+    hash -r
+    return 0
 }
 
-# 修改后的基于实际数据的GB5预估函数
-# 修改后的基于实际数据的GB5预估函数（纯Bash整数运算）
-estimate_gb5_from_benchmarks() {
-    local bzip2=$BZIP2_SPEED
-    local sha256=$SHA256_SPEED
-    local md5sum=$MD5SUM_SPEED
-    
-    # 确保所有参数都是整数
-    bzip2=${bzip2%.*}
-    sha256=${sha256%.*}
-    md5sum=${md5sum%.*}
-    
-    # 基于两组实际测试数据：
-    # 数据1: bzip2=263, sha256=580, md5sum=919 → GB5=2000
-    # 数据2: bzip2=152, sha256=262, md5sum=613 → GB5=1200
-    
-    local gb5_v1=$(( (38 * bzip2 + 12 * sha256 + 8 * md5sum + 2000) / 10 ))
-    
-    # 方法2: 标准化加权平均（使用整数运算）
-    # 2000 * (0.4*bzip2/263 + 0.3*sha256/580 + 0.3*md5sum/919)
-    # 转换为整数运算：先乘1000再除1000
-    local bzip2_part=$(( 400 * bzip2 / 263 ))
-    local sha256_part=$(( 300 * sha256 / 580 ))
-    local md5_part=$(( 300 * md5sum / 919 ))
-    local gb5_v2=$(( 2000 * (bzip2_part + sha256_part + md5_part) / 1000 ))
-    
-    # 方法3: 基于第二组数据的比例（使用整数运算）
-    # 1200 * ((bzip2/152 + sha256/262 + md5sum/613)/3)
-    local bzip2_ratio=$(( 100 * bzip2 / 152 ))
-    local sha256_ratio=$(( 100 * sha256 / 262 ))
-    local md5_ratio=$(( 100 * md5sum / 613 ))
-    local avg_ratio=$(( (bzip2_ratio + sha256_ratio + md5_ratio) / 3 ))
-    local gb5_v3=$(( 1200 * avg_ratio / 100 ))
-    
-    # 综合三种方法（权重：v1=40%, v2=30%, v3=30%）
-    local final_gb5=$(( (gb5_v1 * 4 + gb5_v2 * 3 + gb5_v3 * 3) / 10 ))
-    
-    # 范围限制
-    if [[ $final_gb5 -lt 300 ]]; then
-        final_gb5=300
-    elif [[ $final_gb5 -gt 4000 ]]; then
-        final_gb5=4000
+prepare_cpubench_source() {
+    local dest_dir="/tmp/cpubench-src"
+    local script_dir self
+    rm -rf "$dest_dir"
+    mkdir -p "$dest_dir"
+    self="${BASH_SOURCE[0]}"
+    script_dir=$(cd "$(dirname "$self")" 2>/dev/null && pwd)
+    if [[ -n "$script_dir" && -f "${script_dir}/cpubench.go" ]]; then
+        cp "${script_dir}/cpubench.go" "${dest_dir}/cpubench.go"
+    elif [[ -f "./cpubench.go" ]]; then
+        cp "./cpubench.go" "${dest_dir}/cpubench.go"
+    elif [[ -f "$self" ]]; then
+        awk '
+            $0 == "#__CPUBENCH_GO__" { p = 1; next }
+            $0 == "#__CPUBENCH_END__" { p = 0 }
+            p { print }
+        ' "$self" > "${dest_dir}/cpubench.go"
     fi
-    
-    echo "$final_gb5"
+    if ! grep -q '^package main' "${dest_dir}/cpubench.go" 2>/dev/null; then
+        echo "找不到 cpubench.go。请和 benchx.sh 放在一起，或使用带嵌入源码的脚本。"
+        return 1
+    fi
+}
 
-} 
+build_cpubench() {
+    ensure_go || return 1
+    prepare_cpubench_source || return 1
+    echo "编译 cpubench ($(go version 2>/dev/null))..."
+    if ! (
+        cd /tmp/cpubench-src || exit 1
+        export GO111MODULE=on
+        export GOPROXY=off
+        export GOSUMDB=off
+        export CGO_ENABLED=0
+        export GOTOOLCHAIN=local
+        rm -f go.mod go.sum
+        go mod init cpubench >/dev/null 2>&1 || exit 1
+        go build -ldflags="-s -w" -o /tmp/cpubench .
+    ); then
+        echo "cpubench 编译失败"
+        return 1
+    fi
+    [[ -x /tmp/cpubench ]]
+}
+
 # ==================== 虚拟化检测 ====================
 detect_virtualization() {
     echo -e "\n\033[1;35m[系统信息] 虚拟化技术检测\033[0m"
@@ -253,116 +291,83 @@ test_disk_performance() {
     # 清理临时文件
     rm -f "$test_file" "$result_file" 2>/dev/null
 } 	
-test_cpu_multicore_efficiency() {
-    cores=$(nproc) 
-    
-    # 1. 单核性能测试
-    echo "执行单核测试..."
-    local single_output=$(openssl speed -multi 1 rsa2048 2>/dev/null | grep 'rsa 2048')
-    # 提取时间值并转换为秒（移除's'后缀）
-    local single_time_s=$(echo $single_output | awk '{gsub(/s/, "", $7); print $7}')
-    # 转换为纯数字（使用bc处理浮点数）
-    local single_time=$(echo $single_time_s | bc -l)
-    
-    # 2. 多核性能测试
-    echo "执行多核测试（使用 $cores 个核心）..."
-    local multi_output=$(openssl speed -multi $cores rsa2048 2>/dev/null | grep 'rsa 2048')
-    local multi_time_s=$(echo $multi_output | awk '{gsub(/s/, "", $7); print $7}')
-    local multi_time=$(echo $multi_time_s | bc -l)
-    
-    # 3. 计算实际扩展效率
-    # 性能值 = 1/时间（签名次数/秒）
-    local single_perf=$(echo "scale=10; 1 / $single_time" | bc -l)
-    local multi_perf=$(echo "scale=10; 1 / $multi_time" | bc -l)
-    
-    # 正确公式：效率 = 多核性能 / (单核性能 × 核心数)
-    actual_efficiency=$(echo "scale=4; $single_perf  / ($multi_perf )" | bc -l)
-    echo "$single_perf"
-    echo "$multi_perf"
-    # 输出效率（保留两位小数）
-    printf "%.2f\n" "$actual_efficiency"
-}
-# 新增：多核扩展效率测试函数
-test_cpu_multicore_effici1ency() {
-    cores=$(nproc) 
-    
-    # 1. 单核性能测试
-    local single_start=$(date +%s%N)
-    local single_perf=$(openssl speed -multi 1 rsa2048 2>/dev/null | grep 'rsa 2048') # | awk '{print $5}'
-    local single_end=$(date +%s%N)
-    local single_time_ms=$(( (single_end - single_start) / 1000000 ))
-    
-    # 2. 多核压力测试
-    local multi_start=$(date +%s%N)
-    local multi_perf=$(openssl speed -multi $cores rsa2048 2>/dev/null | grep 'rsa 2048' )#| awk '{print $5}'
-    local multi_end=$(date +%s%N)
-    local multi_time_ms=$(( (multi_end - multi_start) / 1000000 ))
-    
-    # 3. 计算实际扩展效率
-    local theoretical_time=$(( $single_perf * cores ))
-    actual_efficiency=$((theoretical_time / multi_perf))
-    #echo "$actual_efficiency"
-    
-}
-
 # ==================== 2. CPU性能测试 ====================
 test_cpu_performance() {
-    echo -e "\n\033[1;34m[CPU测试] 单核/多核计算能力\033[0m"
-    
-    # 获取CPU信息用于校准
-    local cpu_model=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | sed 's/^ *//')
-    cores=$(nproc)
-    local cpu_mhz=$(grep "cpu MHz" /proc/cpuinfo | head -1 | awk '{print $4}' | cut -d. -f1)
-    [[ -z "$cpu_mhz" ]] && cpu_mhz=2000
-    
+    echo -e "\n\033[1;34m[CPU测试] 单核/多核计算能力（cpubench）\033[0m"
+
+    local cpu_model cpu_mhz physical eff cv go_ver name single multi scale json
+    cpu_model=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
+    [[ -z "$cpu_model" ]] && cpu_model="未知"
+    cores=$(nproc 2>/dev/null || echo 1)
+    [[ "$cores" =~ ^[0-9]+$ ]] || cores=1
+    [[ "$cores" -lt 1 ]] && cores=1
+    cpu_mhz=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{print $4}' | cut -d. -f1)
+    [[ -z "$cpu_mhz" ]] && cpu_mhz="未知"
+
     echo "CPU型号: $cpu_model"
-    echo "核心数: $cores, 频率: ${cpu_mhz}MHz"
-    
-    # 运行基准测试
-    run_cpu_benchmarks
-    # 基于基准测试预估GB5分数
-    CPU_SINGLE_SCORE=$(estimate_gb5_from_benchmarks)
-    echo "base score：$CPU_SINGLE_SCORE"
-    local cpu_single=$CPU_SINGLE_SCORE
-     # ---- 型号特定系数（单核） ------------------------------------
-    # 注意：EPYC 的判断必须放在所有 Ryzen 之后！
-    if [[ "$cpu_model" =~ "Ryzen" ]]; then
-       # 先尝试匹配带P型号
-        if [[ "$cpu_model" =~ [[:space:]]+[0-9]{4}X ]]; then
-            CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 110 / 100))  # 9700x等带x型号
-        else
-            CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 98 / 100))  
-        fi 
-    elif [[ "$cpu_model" =~ "EPYC" ]]; then
-          # 先尝试匹配带P型号
-        if [[ "$cpu_model" =~ EPYC[[:space:]]+7[0-9]{3}P ]]; then
-            CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 130 / 100))  # 7502P等带P型号
-        else
-            CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 180 / 100))  # 标准EPYC型号
-        fi
-    elif [[ "$cpu_model" =~ "Xeon.*Gold" ]]; then
-        CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 98 / 100))
-    elif [[ "$cpu_model" =~ "Xeon.*Silver" ]]; then
-        CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 97 / 100))
-    elif [[ "$cpu_model" =~ "Xeon" ]]; then
-        CPU_SINGLE_SCORE=$((CPU_SINGLE_SCORE * 95 / 100))
+    echo "逻辑核心: $cores, 频率: ${cpu_mhz}MHz"
+    physical=$(awk '
+        /^physical id/ { id = $NF; ids[id] = 1 }
+        /^cpu cores/   { if (id == "") id = "x"; cores[id] = $NF }
+        END {
+            s = 0
+            for (i in ids) s += cores[i]
+            print s + 0
+        }
+    ' /proc/cpuinfo)
+    if [[ "$physical" =~ ^[0-9]+$ && "$physical" -gt 0 && "$physical" -ne "$cores" ]]; then
+        echo "物理核心约: $physical（逻辑核心更多时多半开了超线程，scale 对不齐逻辑核心数是正常的）"
     fi
-    echo "单核评分: $(format_number "$CPU_SINGLE_SCORE") (预估GB5)"
-    # 新增：测试多核扩展效率
-    echo "测试多核"
-    test_cpu_multicore_efficiency 
-    echo "扩展多核系数：$actual_efficiency"
-    # 计算多核分数
-    if (( $(echo "$actual_efficiency / $cores < 0.85" | bc -l) )); then
-        # 扩展效率较低时使用方案a
-        CPU_MULTI_SCORE=$(echo "scale=0; $CPU_SINGLE_SCORE * $actual_efficiency *$actual_efficiency / $cores * 0.92 / 1" | bc)
-        echo "检测到扩展效率较低，使用核心数优化算法"
-    else
-        # 扩展效率较高时使用方案b
-        CPU_MULTI_SCORE=$(echo "scale=0; $cpu_single * $actual_efficiency * 0.92 / 1" | bc)
-        echo "检测到良好扩展效率，使用效率优先算法"
-    fi 
-    echo "多核评分: $(format_number "$CPU_MULTI_SCORE") (预估GB5)" 
+    echo "pointer_chase 多核大约占用 $((cores * 8))MB 内存"
+
+    CPU_BENCH_OK=0
+    if ! build_cpubench; then
+        echo "CPU 基准没编出来，跳过"
+        return
+    fi
+
+    echo "运行 CPU 基准：重复 ${CPU_BENCH_REPS} 次取中位数，每项 ${CPU_BENCH_DURATION}"
+    echo "（改时长：CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh）"
+    if ! json=$(/tmp/cpubench -d "$CPU_BENCH_DURATION" -reps "$CPU_BENCH_REPS" -json); then
+        echo "cpubench 运行失败"
+        return
+    fi
+    printf '%s\n' "$json" > /tmp/cpubench_result.json
+
+    if ! command -v jq >/dev/null 2>&1 || ! jq -e '.single_geomean > 0' >/dev/null <<<"$json"; then
+        echo "结果解析失败，原始输出在 /tmp/cpubench_result.json"
+        return
+    fi
+
+    for name in hash_lookup string_render pointer_chase json_roundtrip branchy_parse; do
+        single=$(jq -r --arg n "$name" '.results[$n].single' <<<"$json")
+        multi=$(jq -r --arg n "$name" '.results[$n].multi' <<<"$json")
+        scale=$(jq -r --arg n "$name" '.results[$n].scale' <<<"$json")
+        printf "  %-16s single=%12.0f  multi=%12.0f  scale=%5.2fx\n" "$name" "$single" "$multi" "$scale"
+    done
+
+    CPU_SINGLE_SCORE=$(jq -r '.single_geomean | floor' <<<"$json")
+    CPU_MULTI_SCORE=$(jq -r '.multi_geomean | floor' <<<"$json")
+    CPU_SCALE=$(awk -v s="$(jq -r '.scale_geomean' <<<"$json")" 'BEGIN { printf "%.4f", s }')
+    STEAL_PCT=$(awk -v s="$(jq -r '.steal_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
+    cv=$(awk -v s="$(jq -r '.single_cv_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
+    go_ver=$(jq -r '.go_version' <<<"$json")
+    actual_efficiency="$CPU_SCALE"
+    [[ "$CPU_SINGLE_SCORE" =~ ^[0-9]+$ ]] || CPU_SINGLE_SCORE=0
+    [[ "$CPU_MULTI_SCORE" =~ ^[0-9]+$ ]] || CPU_MULTI_SCORE=0
+    CPU_BENCH_OK=1
+
+    eff=$(awk -v s="$CPU_SCALE" -v c="$cores" 'BEGIN { if (c < 1) c = 1; printf "%.1f", (s / c) * 100 }')
+    echo "Go 版本: $go_ver（换机器对比必须相同）"
+    echo "单核综合指数: $(format_number "$CPU_SINGLE_SCORE")（五项 single 的几何平均，ops/s，不是 GB5）"
+    echo "多核综合指数: $(format_number "$CPU_MULTI_SCORE")（五项 multi 的几何平均，ops/s，不是 GB5）"
+    echo "扩展比: ${CPU_SCALE}x / ${cores} 线程，并行效率 ${eff}%"
+    echo "测试期间 steal: ${STEAL_PCT}%（持续高于几个百分点就要怀疑宿主机超卖）"
+    if [[ "$CPU_BENCH_REPS" -gt 1 ]]; then
+        echo "单核综合指数重复 CV: ${cv}%（偏大说明这次短测不稳，别直接拿去比）"
+    fi
+    echo "GB5 先不估。把 /tmp/cpubench_result.json 和这台机器的 GB5 单核/多核发回来再拟合。"
+    echo "原始结果: /tmp/cpubench_result.json"
 }
 
 # ==================== 3. 内存带宽测试 ====================
@@ -518,57 +523,39 @@ assess_overselling() {
     local io_score=0
     local total_score=0
     
-    # 1. CPU超售检测
-    if [[ "$actual_efficiency" != "0" ]]; then
-        # 多核扩展效率评估
-        local efficiency_percent=$(echo "$actual_efficiency / $cores * 100" | bc -l | cut -d. -f1)
-        
+    # 1. CPU超售检测（cpubench 的 scale / 逻辑核心，外加 steal）
+    if [[ "$CPU_BENCH_OK" -eq 1 && "$actual_efficiency" != "0" ]]; then
+        local efficiency_percent steal_int
+        efficiency_percent=$(awk -v s="$actual_efficiency" -v c="$cores" 'BEGIN { if (c < 1) c = 1; printf "%d", (s / c) * 100 }')
+        steal_int=$(awk -v s="${STEAL_PCT:-0}" 'BEGIN { printf "%d", s+0 }')
+        [[ "$efficiency_percent" =~ ^[0-9]+$ ]] || efficiency_percent=0
+
+        echo "CPU扩展效率: ${efficiency_percent}%（scale ${actual_efficiency} / ${cores} 线程）"
+        echo "CPU steal: ${STEAL_PCT}%"
+
         if [[ $efficiency_percent -ge 85 ]]; then
-            echo "CPU扩展效率: 优秀 ($efficiency_percent%) - 无超售迹象"
+            echo "CPU扩展效率: 优秀 - 无超售迹象"
             cpu_score=3
         elif [[ $efficiency_percent -ge 70 ]]; then
-            echo "CPU扩展效率: 良好 ($efficiency_percent%) - 轻度超售"
+            echo "CPU扩展效率: 良好 - 轻度超售，或只是超线程在分执行单元"
             cpu_score=2
         elif [[ $efficiency_percent -ge 50 ]]; then
-            echo "CPU扩展效率: 一般 ($efficiency_percent%) - 中度超售"
+            echo "CPU扩展效率: 一般 - 中度超售或被限速"
             cpu_score=1
         else
-            echo "CPU扩展效率: 差 ($efficiency_percent%) - 严重超售"
+            echo "CPU扩展效率: 差 - 严重超售或被限速"
             cpu_score=0
         fi
-    else
-        # 基于CPU型号和性能比对的备选方案
-        local expected_score=0
-        case "$cpu_model" in
-            *Xeon*Gold*)
-                expected_score=2500
-                ;;
-            *Xeon*Silver*)
-                expected_score=1800
-                ;;
-            *Ryzen*9*)
-                expected_score=2200
-                ;;
-            *EPYC*)
-                expected_score=2000
-                ;;
-            *)
-                expected_score=1500
-                ;;
-        esac
-        
-        local performance_ratio=$(( CPU_SINGLE_SCORE * 100 / expected_score ))
-        
-        if [[ $performance_ratio -ge 90 ]]; then
-            echo "CPU性能: 符合预期 ($performance_ratio% 达到同类CPU水平) - 无超售迹象"
-            cpu_score=3
-        elif [[ $performance_ratio -ge 70 ]]; then
-            echo "CPU性能: 略低于预期 ($performance_ratio% 达到同类CPU水平) - 可能超售"
-            cpu_score=2
-        else
-            echo "CPU性能: 显著低于预期 ($performance_ratio% 达到同类CPU水平) - 可能严重超售"
-            cpu_score=1
+        if [[ $steal_int -ge 10 ]]; then
+            echo "steal 很高 - 宿主机很可能在超卖 CPU"
+            cpu_score=0
+        elif [[ $steal_int -ge 4 && $cpu_score -gt 0 ]]; then
+            echo "steal 高于几个百分点 - 有超卖迹象，评分下调"
+            cpu_score=$((cpu_score - 1))
         fi
+    else
+        echo "CPU 基准没有跑成，跳过 CPU 超售判断"
+        cpu_score=1
     fi
     
     # 2. 内存超售检测
@@ -665,3 +652,371 @@ main() {
 
 # 执行主程序
 main "$@"
+exit $?
+
+# 下面这段不执行，只给 prepare_cpubench_source 在找不到同目录 cpubench.go 时抽出。
+# 和 cpubench.go 保持同一份。同目录有 cpubench.go 时以那个文件为准。
+#__CPUBENCH_GO__
+// cpubench：五项和建站相关的 CPU 微基准。
+// 单核分看 single，并行容量看 multi 和 scale，偷取看 steal_pct。
+// 跨机器比较必须用同一个 Go 版本、同一份二进制，重复跑取中位数。
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var sink uint64
+
+type bench struct {
+	name string
+	mk   func(seed int64) func() uint64 // 返回“一批工作”，结果为完成的操作数
+}
+
+func benchHash(seed int64) func() uint64 {
+	keys := make([]string, 50000)
+	m := make(map[string]int, len(keys))
+	for i := range keys {
+		keys[i] = "option_" + strconv.Itoa(i*7919)
+		m[keys[i]] = i
+	}
+	r := rand.New(rand.NewSource(seed))
+	return func() uint64 {
+		s := 0
+		for i := 0; i < 1000; i++ {
+			s += m[keys[r.Intn(len(keys))]]
+		}
+		atomic.AddUint64(&sink, uint64(s))
+		return 1000
+	}
+}
+
+func benchString(_ int64) func() uint64 {
+	tpl := strings.Repeat(`<div class="{{cls}}"><a href="{{url}}">{{title}}</a></div>`+"\n", 200)
+	return func() uint64 {
+		s := strings.ReplaceAll(tpl, "{{cls}}", "post")
+		s = strings.ReplaceAll(s, "{{url}}", "/2026/10/hello-world/")
+		s = strings.ReplaceAll(s, "{{title}}", "Hello World")
+		atomic.AddUint64(&sink, uint64(len(s)+strings.Count(s, "<a ")+strings.Index(s, "World")))
+		return 1
+	}
+}
+
+func benchChase(seed int64) func() uint64 {
+	n := 1 << 21 // 8MB，超过常见 L2
+	next := make([]int32, n)
+	perm := rand.New(rand.NewSource(seed)).Perm(n)
+	for i := 0; i < n; i++ { // 构造单一大环，避免提前回到起点
+		next[perm[i]] = int32(perm[(i+1)%n])
+	}
+	p := int32(0)
+	return func() uint64 {
+		for i := 0; i < 100000; i++ {
+			p = next[p]
+		}
+		atomic.AddUint64(&sink, uint64(p))
+		return 100000
+	}
+}
+
+type post struct {
+	ID    int               `json:"id"`
+	Title string            `json:"title"`
+	Tags  []string          `json:"tags"`
+	Meta  map[string]string `json:"meta"`
+}
+
+func benchJSON(_ int64) func() uint64 {
+	p := post{
+		ID:    42,
+		Title: "Hello World",
+		Tags:  []string{"a", "b", "c", "wordpress"},
+		Meta:  map[string]string{"_edit_lock": "1700000000:1", "_thumbnail_id": "123", "views": "9999"},
+	}
+	return func() uint64 {
+		b, _ := json.Marshal(p)
+		var q post
+		_ = json.Unmarshal(b, &q)
+		atomic.AddUint64(&sink, uint64(q.ID+len(b)))
+		return 1
+	}
+}
+
+func benchBranchy(seed int64) func() uint64 {
+	alpha := []byte("<>/ab =\"\n")
+	r := rand.New(rand.NewSource(seed))
+	data := make([]byte, 64*1024)
+	for i := range data {
+		data[i] = alpha[r.Intn(len(alpha))]
+	}
+	return func() uint64 {
+		state, tags, quotes := 0, 0, 0
+		for _, c := range data {
+			switch state {
+			case 0:
+				if c == '<' {
+					state = 1
+				}
+			case 1:
+				if c == '>' {
+					tags++
+					state = 0
+				} else if c == '"' {
+					state = 2
+				}
+			case 2:
+				if c == '"' {
+					quotes++
+					state = 1
+				}
+			}
+		}
+		atomic.AddUint64(&sink, uint64(tags+quotes))
+		return 1
+	}
+}
+
+var benches = []bench{
+	{"hash_lookup", benchHash},
+	{"string_render", benchString},
+	{"pointer_chase", benchChase},
+	{"json_roundtrip", benchJSON},
+	{"branchy_parse", benchBranchy},
+}
+
+// 准备阶段不计入计时。单线程时把 GOMAXPROCS 收到 1，避免 GC 蹭到别的核。
+func run(b bench, threads int, dur time.Duration) float64 {
+	if threads < 1 {
+		threads = 1
+	}
+	prev := runtime.GOMAXPROCS(threads)
+	defer runtime.GOMAXPROCS(prev)
+
+	var total uint64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	ready := make(chan struct{})
+	var readyN int64
+
+	for t := 0; t < threads; t++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			runtime.LockOSThread()
+			work := b.mk(seed)
+			if atomic.AddInt64(&readyN, 1) == int64(threads) {
+				close(ready)
+			}
+			<-start
+			t0 := time.Now()
+			var ops uint64
+			for time.Since(t0) < dur {
+				ops += work()
+			}
+			atomic.AddUint64(&total, ops)
+		}(int64(t) + 1)
+	}
+	<-ready
+	close(start)
+	wg.Wait()
+	runtime.GC()
+	return float64(total) / dur.Seconds()
+}
+
+func readCPU() (steal, total uint64) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return
+	}
+	f := strings.Fields(strings.SplitN(string(data), "\n", 2)[0])
+	for i := 1; i < len(f) && i <= 8; i++ {
+		v, _ := strconv.ParseUint(f[i], 10, 64)
+		total += v
+		if i == 8 {
+			steal = v
+		}
+	}
+	return
+}
+
+func meanOf(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	var s float64
+	for _, x := range xs {
+		s += x
+	}
+	return s / float64(len(xs))
+}
+
+func cvRatio(xs []float64) float64 {
+	if len(xs) < 2 {
+		return 0
+	}
+	m := meanOf(xs)
+	if m == 0 {
+		return 0
+	}
+	var v float64
+	for _, x := range xs {
+		d := x - m
+		v += d * d
+	}
+	return math.Sqrt(v/float64(len(xs))) / m
+}
+
+func stability(secs int) (mean, cv float64) {
+	var xs []float64
+	for i := 0; i < secs; i++ {
+		xs = append(xs, run(benches[1], 1, time.Second))
+	}
+	return meanOf(xs), cvRatio(xs)
+}
+
+func median(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	cp := append([]float64(nil), xs...)
+	sort.Float64s(cp)
+	n := len(cp)
+	if n%2 == 1 {
+		return cp[n/2]
+	}
+	return (cp[n/2-1] + cp[n/2]) / 2
+}
+
+func geomean(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := 0.0
+	for _, x := range xs {
+		if x <= 0 {
+			return 0
+		}
+		s += math.Log(x)
+	}
+	return math.Exp(s / float64(len(xs)))
+}
+
+type benchResult struct {
+	Single float64 `json:"single"`
+	Multi  float64 `json:"multi"`
+	Scale  float64 `json:"scale"`
+}
+
+func main() {
+	d := flag.Duration("d", 2*time.Second, "每项测试时长")
+	reps := flag.Int("reps", 1, "重复次数，取中位数")
+	stab := flag.Int("stable", 0, "稳定性测试秒数(0 为跳过)")
+	asJSON := flag.Bool("json", false, "输出 JSON")
+	flag.Parse()
+	if *reps < 1 {
+		*reps = 1
+	}
+
+	n := runtime.NumCPU()
+	s0, t0 := readCPU()
+
+	type samples struct {
+		single []float64
+		multi  []float64
+	}
+	collected := make(map[string]*samples, len(benches))
+	for _, b := range benches {
+		collected[b.name] = &samples{}
+	}
+	repSingleGM := make([]float64, 0, *reps)
+
+	for rep := 0; rep < *reps; rep++ {
+		var singles []float64
+		for _, b := range benches {
+			one := run(b, 1, *d)
+			all := run(b, n, *d)
+			collected[b.name].single = append(collected[b.name].single, one)
+			collected[b.name].multi = append(collected[b.name].multi, all)
+			singles = append(singles, one)
+		}
+		repSingleGM = append(repSingleGM, geomean(singles))
+	}
+
+	res := make(map[string]benchResult, len(benches))
+	singleMeds := make([]float64, 0, len(benches))
+	multiMeds := make([]float64, 0, len(benches))
+	for _, b := range benches {
+		s := collected[b.name]
+		one := median(s.single)
+		all := median(s.multi)
+		scale := 0.0
+		if one > 0 {
+			scale = all / one
+		}
+		res[b.name] = benchResult{Single: one, Multi: all, Scale: scale}
+		singleMeds = append(singleMeds, one)
+		multiMeds = append(multiMeds, all)
+	}
+
+	s1, t1 := readCPU()
+	steal := 0.0
+	if t1 > t0 {
+		steal = float64(s1-s0) / float64(t1-t0) * 100
+	}
+
+	singleGM := geomean(singleMeds)
+	multiGM := geomean(multiMeds)
+	scaleGM := 0.0
+	if singleGM > 0 {
+		scaleGM = multiGM / singleGM
+	}
+
+	out := map[string]interface{}{
+		"cpus":           n,
+		"go_version":     runtime.Version(),
+		"reps":           *reps,
+		"duration_sec":   d.Seconds(),
+		"steal_pct":      steal,
+		"single_geomean": singleGM,
+		"multi_geomean":  multiGM,
+		"scale_geomean":  scaleGM,
+		"single_cv_pct":  cvRatio(repSingleGM) * 100,
+		"results":        res,
+	}
+	if *stab > 0 {
+		m, cv := stability(*stab)
+		out["stability"] = map[string]float64{"mean_ops": m, "cv_pct": cv * 100}
+	}
+
+	if *asJSON {
+		buf, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(buf))
+		return
+	}
+	fmt.Printf("CPUs: %d  Go: %s  steal: %.2f%%  reps: %d\n", n, runtime.Version(), steal, *reps)
+	for _, b := range benches {
+		r := res[b.name]
+		fmt.Printf("%-16s single=%12.0f  multi=%12.0f  scale=%.2fx\n", b.name, r.Single, r.Multi, r.Scale)
+	}
+	fmt.Printf("geomean          single=%12.0f  multi=%12.0f  scale=%.2fx", singleGM, multiGM, scaleGM)
+	if *reps > 1 {
+		fmt.Printf("  CV=%.2f%%", cvRatio(repSingleGM)*100)
+	}
+	fmt.Println()
+	if s, ok := out["stability"].(map[string]float64); ok {
+		fmt.Printf("stability: mean=%.0f ops/s  CV=%.2f%%\n", s["mean_ops"], s["cv_pct"])
+	}
+}
+#__CPUBENCH_END__
