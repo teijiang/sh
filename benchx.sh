@@ -1,11 +1,11 @@
 #!/bin/bash
-# VPS 性能快速检测脚本 v0.2
+# VPS 性能快速检测脚本 v0.1
 # by tj 机组(teijiang,远古巨瘦,钻舰队长,鸡贼王，石巨人,牛头人)带领claude、dp3出品
 # CPU 项改为 cpubench（Go）。综合指数是五项 ops/s 的几何平均，不是 GB5；拿到对照机器后再校准。
 
-echo -e "\033[1;34m===== 站长 VPS 性能快速检测 v0.2 =====\033[0m"
+echo -e "\033[1;34m===== 站长 VPS 性能快速检测 v0.3 =====\033[0m"
 echo "专注检测：IO性能、CPU（cpubench）、内存带宽、超售程度"
-echo "预计耗时：约 90 秒（CPU 默认 3 次取中位数；首次会下载 Go 工具链）"
+echo "预计耗时：约 90 秒（CPU 默认 3 次取中位数；首次会下载 cpubench 二进制）"
  
 # 全局变量
 declare -gi DISK_IOPS=0
@@ -20,7 +20,7 @@ declare -gi CPU_BENCH_OK=0
 # 每项时长和重复次数。例：CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh
 declare -g CPU_BENCH_DURATION="${CPU_BENCH_DURATION:-1s}"
 declare -gi CPU_BENCH_REPS="${CPU_BENCH_REPS:-3}"
-declare -g GO_TOOLCHAIN="${GO_TOOLCHAIN:-go1.22.10}"
+declare -g CPUBENCH_BASE_URL="${CPUBENCH_BASE_URL:-https://raw.githubusercontent.com/teijiang/sh/main/cpubench}"
 declare -g DISK_IOPS_STR="0"    # 字符串存储综合评分
 declare -g read_iops_formatted="0"   # 字符串存储原始IOPS值
 declare -g write_bw_formatted="0"    # 字符串存储原始带宽值
@@ -65,9 +65,9 @@ float_compare() {
     echo "$val1 $op $val2" | bc -l 2>/dev/null || echo 0
 } 
  
-# 优先用脚本同目录的 cpubench.go，否则从本文件末尾的嵌入副本抽出。
-ensure_go() {
-    local arch tar root url tmp unpack download_ok
+# 下载与当前 Linux 架构匹配的预编译 cpubench，不在服务器安装 Go。
+build_cpubench() {
+    local arch url bin=/tmp/cpubench
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
         aarch64|arm64) arch=arm64 ;;
@@ -77,111 +77,22 @@ ensure_go() {
             ;;
     esac
 
-    export GOTOOLCHAIN=local
-    for root in "/opt/${GO_TOOLCHAIN}" "${HOME:-/tmp}/.${GO_TOOLCHAIN}"; do
-        if [[ -x "${root}/bin/go" ]]; then
-            export GOROOT="$root"
-            export PATH="${root}/bin:${PATH}"
-            hash -r
-            return 0
-        fi
-    done
-
-    if command -v go >/dev/null 2>&1 && go version 2>/dev/null | grep -q "${GO_TOOLCHAIN} "; then
-        return 0
-    fi
-
-    root="${HOME:-/tmp}/.${GO_TOOLCHAIN}"
-    if mkdir -p /opt >/dev/null 2>&1 && [[ -w /opt ]]; then
-        root="/opt/${GO_TOOLCHAIN}"
-    fi
-
-    tar="${GO_TOOLCHAIN}.linux-${arch}.tar.gz"
-    tmp="/tmp/${tar}"
-    echo "下载固定 Go 工具链 ${GO_TOOLCHAIN}（各机器必须同版本才能比分数）..."
-    download_ok=0
-    for url in \
-        "https://mirrors.aliyun.com/golang/${tar}" \
-        "https://mirrors.cloud.tencent.com/go/${tar}" \
-        "https://go.dev/dl/${tar}"
-    do
-        echo "  尝试 ${url}"
-        rm -f "$tmp"
-        if command -v curl >/dev/null 2>&1; then
-            curl -fL --retry 2 --connect-timeout 20 -o "$tmp" "$url" && download_ok=1 && break
-        elif command -v wget >/dev/null 2>&1; then
-            wget -q -O "$tmp" "$url" && download_ok=1 && break
-        else
-            echo "没有 curl 或 wget，无法下载 Go"
-            break
-        fi
-    done
-    if [[ "$download_ok" -ne 1 ]]; then
-        if command -v go >/dev/null 2>&1; then
-            echo "工具链下载失败，改用系统 Go：$(go version 2>/dev/null)。换机器对比时分数可能不可比。"
-            return 0
-        fi
-        echo "无法下载 ${GO_TOOLCHAIN}，也没有系统 Go。"
+    url="${CPUBENCH_BASE_URL%/}/cpubench-linux-${arch}"
+    echo "下载 cpubench（Linux ${arch}）: ${url}"
+    rm -f "$bin"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --retry 2 --connect-timeout 20 -o "$bin" "$url" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$bin" "$url" || return 1
+    else
+        echo "缺少 curl 或 wget，无法下载 cpubench"
         return 1
     fi
-
-    unpack="/tmp/${GO_TOOLCHAIN}-unpack"
-    rm -rf "$unpack" "$root"
-    mkdir -p "$unpack" || return 1
-    tar -C "$unpack" -xzf "$tmp" || return 1
-    mkdir -p "$(dirname "$root")" || return 1
-    mv "$unpack/go" "$root" || return 1
-    rm -rf "$unpack" "$tmp"
-    export GOROOT="$root"
-    export PATH="${root}/bin:${PATH}"
-    hash -r
-    return 0
+    chmod +x "$bin" || return 1
+    [[ -x "$bin" ]] || return 1
 }
 
-prepare_cpubench_source() {
-    local dest_dir="/tmp/cpubench-src"
-    local script_dir self
-    rm -rf "$dest_dir"
-    mkdir -p "$dest_dir"
-    self="${BASH_SOURCE[0]}"
-    script_dir=$(cd "$(dirname "$self")" 2>/dev/null && pwd)
-    if [[ -n "$script_dir" && -f "${script_dir}/cpubench.go" ]]; then
-        cp "${script_dir}/cpubench.go" "${dest_dir}/cpubench.go"
-    elif [[ -f "./cpubench.go" ]]; then
-        cp "./cpubench.go" "${dest_dir}/cpubench.go"
-    elif [[ -f "$self" ]]; then
-        awk '
-            $0 == "#__CPUBENCH_GO__" { p = 1; next }
-            $0 == "#__CPUBENCH_END__" { p = 0 }
-            p { print }
-        ' "$self" > "${dest_dir}/cpubench.go"
-    fi
-    if ! grep -q '^package main' "${dest_dir}/cpubench.go" 2>/dev/null; then
-        echo "找不到 cpubench.go。请和 benchx.sh 放在一起，或使用带嵌入源码的脚本。"
-        return 1
-    fi
-}
 
-build_cpubench() {
-    ensure_go || return 1
-    prepare_cpubench_source || return 1
-    echo "编译 cpubench ($(go version 2>/dev/null))..."
-    if ! (
-        cd /tmp/cpubench-src || exit 1
-        export GO111MODULE=on
-        export GOPROXY=off
-        export GOSUMDB=off
-        export CGO_ENABLED=0
-        export GOTOOLCHAIN=local
-        rm -f go.mod go.sum
-        go mod init cpubench >/dev/null 2>&1 || exit 1
-        go build -ldflags="-s -w" -o /tmp/cpubench .
-    ); then
-        echo "cpubench 编译失败"
-        return 1
-    fi
-    [[ -x /tmp/cpubench ]]
-}
 
 # ==================== 虚拟化检测 ====================
 detect_virtualization() {
