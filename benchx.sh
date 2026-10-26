@@ -20,7 +20,7 @@ declare -gi CPU_BENCH_OK=0
 # 每项时长和重复次数。例：CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh
 declare -g CPU_BENCH_DURATION="${CPU_BENCH_DURATION:-1s}"
 declare -gi CPU_BENCH_REPS="${CPU_BENCH_REPS:-3}"
-declare -g CPUBENCH_BASE_URL="${CPUBENCH_BASE_URL:-https://raw.githubusercontent.com/teijiang/sh/main/cpubench/}"
+declare -g CPUBENCH_BASE_URL="${CPUBENCH_BASE_URL:-https://github.com/teijiang/sh/releases/download/main/}"
 declare -g DISK_IOPS_STR="0"    # 字符串存储综合评分
 declare -g read_iops_formatted="0"   # 字符串存储原始IOPS值
 declare -g write_bw_formatted="0"    # 字符串存储原始带宽值
@@ -67,7 +67,7 @@ float_compare() {
  
 # 下载与当前 Linux 架构匹配的预编译 cpubench，不在服务器安装 Go。
 build_cpubench() {
-    local arch url bin=/tmp/cpubench
+    local arch url bin=/tmp/cpubench tmp magic
     case "$(uname -m)" in
         x86_64|amd64) arch=amd64 ;;
         aarch64|arm64) arch=arm64 ;;
@@ -78,18 +78,46 @@ build_cpubench() {
     esac
 
     url="${CPUBENCH_BASE_URL%/}/cpubench-linux-${arch}"
+    tmp="${bin}.download.$$"
     echo "下载 cpubench（Linux ${arch}）: ${url}"
-    rm -f "$bin"
+    rm -f "$bin" "$tmp"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 2 --connect-timeout 20 -o "$bin" "$url" || return 1
+        curl -fL --retry 2 --connect-timeout 20 -o "$tmp" "$url" || {
+            rm -f "$tmp"
+            return 1
+        }
     elif command -v wget >/dev/null 2>&1; then
-        wget -q -O "$bin" "$url" || return 1
+        wget -q -O "$tmp" "$url" || {
+            rm -f "$tmp"
+            return 1
+        }
     else
         echo "缺少 curl 或 wget，无法下载 cpubench"
         return 1
     fi
-    chmod +x "$bin" || return 1
-    [[ -x "$bin" ]] || return 1
+
+    # Linux Go 二进制必须以 ELF 魔数 7f 45 4c 46 开头。
+    # 如果这里失败，通常是上传了 Windows exe、源码/网页，或 Git LFS 指针。
+    magic=$(od -An -tx1 -N4 "$tmp" 2>/dev/null | tr -d ' \n\r')
+    if [[ "$magic" != "7f454c46" ]]; then
+        echo "下载内容不是 Linux ELF 二进制，无法运行：${url}"
+        if command -v file >/dev/null 2>&1; then
+            file "$tmp"
+        fi
+        echo "请重新上传由 GOOS=linux 编译的 cpubench-linux-${arch} 文件。"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    chmod +x "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
+    mv -f "$tmp" "$bin" || {
+        rm -f "$tmp"
+        return 1
+    }
+    [[ -x "$bin" ]]
 }
 
 
