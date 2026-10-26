@@ -20,7 +20,7 @@ declare -gi CPU_BENCH_OK=0
 # 每项时长和重复次数。例：CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh
 declare -g CPU_BENCH_DURATION="${CPU_BENCH_DURATION:-1s}"
 declare -gi CPU_BENCH_REPS="${CPU_BENCH_REPS:-3}"
-declare -g CPUBENCH_BASE_URL="${CPUBENCH_BASE_URL:-https://raw.githubusercontent.com/teijiang/sh/main/cpubench}"
+declare -g CPUBENCH_BASE_URL="${CPUBENCH_BASE_URL:-https://raw.githubusercontent.com/teijiang/sh/main/cpubench/}"
 declare -g DISK_IOPS_STR="0"    # 字符串存储综合评分
 declare -g read_iops_formatted="0"   # 字符串存储原始IOPS值
 declare -g write_bw_formatted="0"    # 字符串存储原始带宽值
