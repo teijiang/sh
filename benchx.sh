@@ -289,14 +289,9 @@ test_cpu_performance() {
 
     CPU_SINGLE_SCORE=$(jq -r '.single_geomean | floor' <<<"$json")
     CPU_MULTI_SCORE=$(jq -r '.multi_geomean | floor' <<<"$json")
-    case "$cores" in
-        1) gb5_factor=0.92 ;;
-        2) gb5_factor=0.85 ;;
-        *) gb5_factor=0.82 ;;
-    esac
-    CPU_GB5_SINGLE_EST=$(awk -v s="$CPU_SINGLE_SCORE" -v f="$gb5_factor" 'BEGIN { printf "%.0f", (484.2732235676 + 0.001651367084733 * s) * f }')
-    CPU_GB5_MULTI_EST=$(awk -v s="$CPU_MULTI_SCORE" -v f="$gb5_factor" 'BEGIN { printf "%.0f", (321.0754887745 + 0.002236085022142 * s) * f }')
     CPU_SCALE=$(awk -v s="$(jq -r '.scale_geomean' <<<"$json")" 'BEGIN { printf "%.4f", s }')
+    CPU_GB5_SINGLE_EST=$(awk -v s="$CPU_SINGLE_SCORE" 'BEGIN { printf "%.0f", 484.2732235676 + 0.001651367084733 * s }')
+    CPU_GB5_MULTI_EST=$(awk -v s="$CPU_GB5_SINGLE_EST" -v x="$CPU_SCALE" 'BEGIN { printf "%.0f", s * x }')
     STEAL_PCT=$(awk -v s="$(jq -r '.steal_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
     cv=$(awk -v s="$(jq -r '.single_cv_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
     go_ver=$(jq -r '.go_version' <<<"$json")
@@ -314,9 +309,9 @@ test_cpu_performance() {
     if [[ "$CPU_BENCH_REPS" -gt 1 ]]; then
         echo "单核综合指数重复 CV: ${cv}%（偏大说明这次短测不稳，别直接拿去比）"
     fi
-    echo "GB5 单核估算: $(format_number "$CPU_GB5_SINGLE_EST")（回归估值 × ${gb5_factor}，仅供参考）"
-    echo "GB5 多核估算: $(format_number "$CPU_GB5_MULTI_EST")（回归估值 × ${gb5_factor}，仅供参考；多核校准样本较少）"
-    echo "估算折扣：${cores} 线程对应 ${gb5_factor}；后续可根据新样本重新拟合。"
+    echo "GB5 单核估算: $(format_number "$CPU_GB5_SINGLE_EST")（单核回归估值，仅供参考）"
+    echo "GB5 多核估算: $(format_number "$CPU_GB5_MULTI_EST")（单核估值 × 扩展比 ${CPU_SCALE}x，仅供参考）"
+    echo "后续可根据新的 cpubench 与 GB5 配对样本重新拟合。"
     echo "原始结果: /tmp/cpubench_result.json"
 }
 
