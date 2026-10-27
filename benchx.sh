@@ -290,7 +290,7 @@ test_cpu_performance() {
     CPU_SINGLE_SCORE=$(jq -r '.single_geomean | floor' <<<"$json")
     CPU_MULTI_SCORE=$(jq -r '.multi_geomean | floor' <<<"$json")
     CPU_SCALE=$(awk -v s="$(jq -r '.scale_geomean' <<<"$json")" 'BEGIN { printf "%.4f", s }')
-    CPU_GB5_SINGLE_EST=$(awk -v s="$CPU_SINGLE_SCORE" 'BEGIN { printf "%.0f", 484.2732235676 + 0.001651367084733 * s }')
+    CPU_GB5_SINGLE_EST=$(awk -v s="$CPU_SINGLE_SCORE" 'BEGIN { printf "%.0f", 484.2732235676 + 0.001651367084733 * s * 0.9}')
     CPU_GB5_MULTI_EST=$(awk -v s="$CPU_GB5_SINGLE_EST" -v x="$CPU_SCALE" 'BEGIN { printf "%.0f", s * x }')
     STEAL_PCT=$(awk -v s="$(jq -r '.steal_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
     cv=$(awk -v s="$(jq -r '.single_cv_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
