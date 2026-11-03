@@ -3,15 +3,18 @@
 # by tj 机组(teijiang,远古巨瘦,钻舰队长,鸡贼王，石巨人,牛头人)带领claude、dp3出品
 # CPU 项改为 cpubench（Go）。综合指数是五项 ops/s 的几何平均，不是 GB5；拿到对照机器后再校准。
 
-echo -e "\033[1;34m===== 站长 VPS 性能快速检测 v0.3 =====\033[0m"
-echo "专注检测：IO性能、CPU（cpubench）、内存带宽、超售程度"
-echo "预计耗时：约 90 秒（CPU 默认 3 次取中位数；首次会下载 cpubench 二进制）"
+echo -e "\033[1;34m========== 站长 VPS 性能检测 v0.3 ==========\033[0m"
+echo "  磁盘 / CPU / 内存 / 稳定性 / 资源争用"
+echo "  预计约 90 秒；CPU 每项 ${CPU_BENCH_DURATION:-1s}，重复 ${CPU_BENCH_REPS:-3} 次"
  
 # 全局变量
 declare -gi DISK_IOPS=0
 declare -gi MEMORY_BANDWIDTH=0
 declare -gi CPU_SINGLE_SCORE=0
 declare -gi CPU_MULTI_SCORE=0
+declare -gi DISK_READ_OK=0
+declare -gi DISK_WRITE_OK=0
+declare -gi DISK_WRITE_MBPS=0
 declare -g NETWORK_LATENCY="0"
 declare -g actual_efficiency=0
 declare -g CPU_SCALE="0"
@@ -84,7 +87,7 @@ build_cpubench() {
     echo "下载 cpubench（Linux ${arch}）: ${url}"
     rm -f "$bin" "$tmp"
     if command -v curl >/dev/null 2>&1; then
-        curl -fL --retry 2 --connect-timeout 20 -o "$tmp" "$url" || {
+        curl -fsSL --retry 2 --connect-timeout 20 -o "$tmp" "$url" || {
             rm -f "$tmp"
             return 1
         }
@@ -126,7 +129,7 @@ build_cpubench() {
 
 # ==================== 虚拟化检测 ====================
 detect_virtualization() {
-    echo -e "\n\033[1;35m[系统信息] 虚拟化技术检测\033[0m"
+    echo -e "\n\033[1;35m━━ 系统信息 ━━\033[0m"
     
     local virt_type="未知"
     
@@ -175,18 +178,23 @@ detect_virtualization() {
 
 # ==================== 1. 磁盘IO性能测试 ====================
 test_disk_performance() {
-    echo -e "\n\033[1;34m[磁盘测试] 建站IO密集型模式测试\033[0m"
+    echo -e "\n\033[1;34m━━ 磁盘测试 ━━\033[0m"
     local test_file="/tmp/wp_io_test.bin"
     local result_file="/tmp/fio_result.json"
     
+    DISK_READ_OK=0
+    DISK_WRITE_OK=0
+    DISK_WRITE_MBPS=0
     # 清理可能的旧文件
     rm -f "$test_file" "$result_file" 2>/dev/null
     
     # 建站典型IO密集型模式：4K随机读写 + 64K顺序写
     echo "测试随机4K读取（数据库查询模式）..."
-    fio --name=wp_db_read --filename="$test_file" --rw=randread --bs=4k \
+    if fio --name=wp_db_read --filename="$test_file" --rw=randread --bs=4k \
         --size=200M --runtime=8 --direct=1 --numjobs=4 --group_reporting \
-        --output-format=json --output="$result_file" >/dev/null 2>&1
+        --output-format=json --output="$result_file" >/dev/null 2>&1; then
+        DISK_READ_OK=1
+    fi
     
     # 改进的解析逻辑
     local read_iops=0
@@ -198,11 +206,15 @@ test_disk_performance() {
         fi
     fi
     [[ -z "$read_iops" ]] || ! [[ "$read_iops" =~ ^[0-9]+$ ]] && read_iops=0
-    
+    [[ "$read_iops" -gt 0 ]] || DISK_READ_OK=0
+
+    rm -f "$result_file"
     echo "测试64K顺序写入（媒体上传模式）..."
-    fio --name=wp_media_write --filename="$test_file" --rw=write --bs=64k \
+    if fio --name=wp_media_write --filename="$test_file" --rw=write --bs=64k \
         --size=200M --runtime=5 --direct=1 --numjobs=2 --group_reporting \
-        --output-format=json --output="$result_file" >/dev/null 2>&1
+        --output-format=json --output="$result_file" >/dev/null 2>&1; then
+        DISK_WRITE_OK=1
+    fi
     
     local write_bw=0
     if [[ -f "$result_file" ]]; then
@@ -213,9 +225,11 @@ test_disk_performance() {
         fi
     fi
     [[ -z "$write_bw" ]] || ! [[ "$write_bw" =~ ^[0-9]+$ ]] && write_bw=0
+    [[ "$write_bw" -gt 0 ]] || DISK_WRITE_OK=0
     
     # 计算写入带宽（MB/s）
     local write_mbps=$((write_bw / 1024))
+    DISK_WRITE_MBPS=$write_mbps
     # 综合IO评分（模拟GB5存储分数）
     DISK_IOPS=$((read_iops + write_bw / 100))
     
@@ -225,16 +239,26 @@ test_disk_performance() {
     
     # 使用字符串存储综合评分
     DISK_IOPS_STR=$read_iops
-    echo "4K 随机读 IOPS: ${read_iops_formatted}"
-    echo "64K 写入带宽: ${write_mbps_formatted} MB/s (${write_bw} KB/s)"
-    echo "综合 IO 评分: $(format_number "$DISK_IOPS")"
+    if (( DISK_READ_OK )); then
+        echo "  4K 随机读取 : ${read_iops_formatted} IOPS"
+    else
+        echo "  4K 随机读取 : 测试失败"
+    fi
+    if (( DISK_WRITE_OK )); then
+        echo "  64K 顺序写入: ${write_mbps_formatted} MB/s (${write_bw} KB/s)"
+    else
+        echo "  64K 顺序写入: 测试失败"
+    fi
+    if (( DISK_READ_OK && DISK_WRITE_OK )); then
+        echo "  综合 IO 评分: $(format_number "$DISK_IOPS")"
+    fi
 
     # 清理临时文件
     rm -f "$test_file" "$result_file" 2>/dev/null
 } 	
 # ==================== 2. CPU性能测试 ====================
 test_cpu_performance() {
-    echo -e "\n\033[1;34m[CPU测试] 单核/多核计算能力（cpubench）\033[0m"
+    echo -e "\n\033[1;34m━━ CPU 测试 ━━\033[0m"
 
     local cpu_model cpu_mhz physical eff cv go_ver name single multi scale json gb5_factor
     cpu_model=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
@@ -245,8 +269,8 @@ test_cpu_performance() {
     cpu_mhz=$(grep -m1 "cpu MHz" /proc/cpuinfo | awk '{print $4}' | cut -d. -f1)
     [[ -z "$cpu_mhz" ]] && cpu_mhz="未知"
 
-    echo "CPU型号: $cpu_model"
-    echo "逻辑核心: $cores, 频率: ${cpu_mhz}MHz"
+    echo "  CPU 型号 : $cpu_model"
+    echo "  逻辑核心 : $cores    频率: ${cpu_mhz} MHz"
     physical=$(awk '
         /^physical id/ { id = $NF; ids[id] = 1 }
         /^cpu cores/   { if (id == "") id = "x"; cores[id] = $NF }
@@ -259,16 +283,16 @@ test_cpu_performance() {
     if [[ "$physical" =~ ^[0-9]+$ && "$physical" -gt 0 && "$physical" -ne "$cores" ]]; then
         echo "物理核心约: $physical（逻辑核心更多时多半开了超线程，scale 对不齐逻辑核心数是正常的）"
     fi
-    echo "pointer_chase 多核大约占用 $((cores * 8))MB 内存"
+    echo "  指针追踪内存占用: 约 $((cores * 8)) MB（多核）"
 
     CPU_BENCH_OK=0
     if ! build_cpubench; then
-        echo "CPU 基准没编出来，跳过"
+        echo "CPU 测试程序下载或校验失败，跳过"
         return
     fi
 
-    echo "运行 CPU 基准：重复 ${CPU_BENCH_REPS} 次取中位数，每项 ${CPU_BENCH_DURATION}"
-    echo "（改时长：CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh）"
+    echo "  测试参数: 每项 ${CPU_BENCH_DURATION}，重复 ${CPU_BENCH_REPS} 次取中位数"
+    echo "  自定义示例: CPU_BENCH_DURATION=2s CPU_BENCH_REPS=1 bash benchx.sh"
     if ! json=$(/tmp/cpubench -d "$CPU_BENCH_DURATION" -reps "$CPU_BENCH_REPS" -json); then
         echo "cpubench 运行失败"
         return
@@ -280,11 +304,14 @@ test_cpu_performance() {
         return
     fi
 
+    echo
+    echo "  基准明细（Single: 单核，Multi: 多核，Scale: 扩展比；单位 ops/s）"
+    printf '  %-16s %12s %12s %8s\n' "Workload" "Single" "Multi" "Scale"
     for name in hash_lookup string_render pointer_chase json_roundtrip branchy_parse; do
         single=$(jq -r --arg n "$name" '.results[$n].single' <<<"$json")
         multi=$(jq -r --arg n "$name" '.results[$n].multi' <<<"$json")
         scale=$(jq -r --arg n "$name" '.results[$n].scale' <<<"$json")
-        printf "  %-16s single=%12.0f  multi=%12.0f  scale=%5.2fx\n" "$name" "$single" "$multi" "$scale"
+        printf '  %-16s %12.0f %12.0f %7.2fx\n' "$name" "$single" "$multi" "$scale"
     done
 
     CPU_SINGLE_SCORE=$(jq -r '.single_geomean | floor' <<<"$json")
@@ -292,7 +319,7 @@ test_cpu_performance() {
     CPU_SCALE=$(awk -v s="$(jq -r '.scale_geomean' <<<"$json")" 'BEGIN { printf "%.4f", s }')
     CPU_GB5_SINGLE_EST=$(awk -v s="$CPU_SINGLE_SCORE" 'BEGIN { printf "%.0f", 484.2732235676 + 0.001651367084733 * s * 0.9}')
     CPU_GB5_MULTI_EST=$(awk -v s="$CPU_GB5_SINGLE_EST" -v x="$CPU_SCALE" 'BEGIN { printf "%.0f", s * x * 1.1 }')
-    STEAL_PCT=$(awk -v s="$(jq -r '.steal_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }') 
+    STEAL_PCT=$(awk -v s="$(jq -r '.steal_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
     cv=$(awk -v s="$(jq -r '.single_cv_pct' <<<"$json")" 'BEGIN { printf "%.2f", s }')
     go_ver=$(jq -r '.go_version' <<<"$json")
     actual_efficiency="$CPU_SCALE"
@@ -301,35 +328,37 @@ test_cpu_performance() {
     CPU_BENCH_OK=1
 
     eff=$(awk -v s="$CPU_SCALE" -v c="$cores" 'BEGIN { if (c < 1) c = 1; printf "%.1f", (s / c) * 100 }')
-    echo "Go 版本: $go_ver（换机器对比必须相同）"
-    echo "单核综合指数: $(format_number "$CPU_SINGLE_SCORE")（五项 single 的几何平均，ops/s，不是 GB5）"
-    echo "多核综合指数: $(format_number "$CPU_MULTI_SCORE")（五项 multi 的几何平均，ops/s，不是 GB5）"
-    echo "扩展比: ${CPU_SCALE}x / ${cores} 线程，并行效率 ${eff}%"
-    echo "测试期间 steal: ${STEAL_PCT}%（持续高于几个百分点就要怀疑宿主机超卖）"
+    echo
+    echo "  综合结果"
+    echo "    单核指数 : $(format_number "$CPU_SINGLE_SCORE") ops/s（五项几何平均，非 GB5）"
+    echo "    多核指数 : $(format_number "$CPU_MULTI_SCORE") ops/s（五项几何平均，非 GB5）"
+    echo "    扩展比   : ${CPU_SCALE}x / ${cores} 线程（并行效率 ${eff}%）"
+    echo "    CPU steal: ${STEAL_PCT}%（偏高可能表示宿主机争用）"
     if [[ "$CPU_BENCH_REPS" -gt 1 ]]; then
-        echo "单核综合指数重复 CV: ${cv}%（偏大说明这次短测不稳，别直接拿去比）"
+        echo "    单核 CV  : ${cv}%（越高表示重复测试波动越大）"
     fi
-    echo "GB5 单核估算: $(format_number "$CPU_GB5_SINGLE_EST")（单核回归估值，仅供参考）"
-    echo "GB5 多核估算: $(format_number "$CPU_GB5_MULTI_EST")（单核估值 × 扩展比 ${CPU_SCALE}x，仅供参考）"
-    echo "后续可根据新的 cpubench 与 GB5 配对样本重新拟合。"
-    echo "原始结果: /tmp/cpubench_result.json"
+    echo
+    echo "  GB5 估算（仅供参考，非实测）"
+    echo "    单核: $(format_number "$CPU_GB5_SINGLE_EST")"
+    echo "    多核: $(format_number "$CPU_GB5_MULTI_EST")（单核估值 × ${CPU_SCALE} × 1.1）"
 }
 
 # ==================== 3. 内存带宽测试 ====================
 test_memory_bandwidth() {
-    echo -e "\n\033[1;34m[内存测试] 内存带宽检测\033[0m"
+    echo -e "\n\033[1;34m━━ 内存测试 ━━\033[0m"
     
     MEMORY_BANDWIDTH=0
     
     echo "内存读写速度测试..."
     if command -v sysbench &>/dev/null; then
         # 使用sysbench测试内存
-        sysbench memory --memory-block-size=1K --memory-total-size=2G \
-            --memory-oper=write --threads=4 --time=5 run > /tmp/mem_test.log 2>&1
-        
-        local mem_result=$(grep "MiB transferred" /tmp/mem_test.log | awk '{print $(NF-2)}' | sed 's/(//')
-        if [[ "$mem_result" =~ ^[0-9.]+$ ]]; then
-            MEMORY_BANDWIDTH=$(echo "$mem_result * 1024 / 5" | bc | cut -d. -f1)  # 转换为MB/s
+        if sysbench memory --memory-block-size=1K --memory-total-size=2G \
+            --memory-oper=write --threads=4 --time=5 run > /tmp/mem_test.log 2>&1; then
+            local mem_result
+            mem_result=$(awk '/MiB transferred/ { for (i=1; i<=NF; i++) if ($i ~ /MiB\/sec/) { v=$(i-1); gsub(/[()]/, "", v); print v; exit } }' /tmp/mem_test.log)
+            if [[ "$mem_result" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                MEMORY_BANDWIDTH=$(awk -v v="$mem_result" 'BEGIN { printf "%d", v }')
+            fi
         fi
         rm -f /tmp/mem_test.log 2>/dev/null
     fi
@@ -339,9 +368,13 @@ test_memory_bandwidth() {
         echo "使用dd测试内存速度..."
         local temp_file="/dev/shm/memtest.tmp"
         if [[ -d "/dev/shm" ]]; then
-            sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-            local dd_result=$(dd if=/dev/zero of="$temp_file" bs=1M count=500 conv=fdatasync 2>&1 | \
-                grep -o '[0-9.]* [MG]B/s' | head -1)
+            local dd_output dd_result
+            if dd_output=$(dd if=/dev/zero of="$temp_file" bs=1M count=500 conv=fdatasync 2>&1); then
+                dd_result=$(printf '%s\n' "$dd_output" | grep -o '[0-9.]* [MG]B/s' | head -1)
+            else
+                dd_result=""
+                echo "dd 内存测试未完成，结果不计入评估"
+            fi
             
             if [[ "$dd_result" =~ ^[0-9.]+\ GB/s ]]; then
                 local gb_speed=$(echo "$dd_result" | awk '{print $1}')
@@ -356,17 +389,16 @@ test_memory_bandwidth() {
     
     if [[ $MEMORY_BANDWIDTH -gt 0 ]]; then
         # 转换为GB/s
-        local mem_gbs=$(echo "scale=2; $MEMORY_BANDWIDTH / 1024" | bc)
-        echo "内存带宽: $(format_number "$MEMORY_BANDWIDTH") MB/s (${mem_gbs} GB/s)"
+        local mem_gbs=$(awk -v m="$MEMORY_BANDWIDTH" 'BEGIN { printf "%.2f", m / 1024 }')
+        echo "  内存带宽: $(format_number "$MEMORY_BANDWIDTH") MB/s (${mem_gbs} GB/s)"
     else
         echo "内存带宽: 无法检测"
-        MEMORY_BANDWIDTH=3000  # 设置默认值
     fi
 }
 
 # ==================== 4. 中断风暴检测 ====================
 test_interrupt_stability() {
-    echo -e "\n\033[1;34m[稳定性测试] 中断和系统负载检测\033[0m"
+    echo -e "\n\033[1;34m━━ 稳定性测试 ━━\033[0m"
     
     local before_file="/tmp/interrupts_before"
     local after_file="/tmp/interrupts_after"
@@ -461,116 +493,125 @@ test_network_latency() {
 
 # ==================== 6. 超售程度评估 ====================
 assess_overselling() {
-    echo -e "\n\033[1;35m[超售检测] 系统资源分配评估\033[0m"
-    
-    local cpu_score=0
-    local memory_score=0
-    local io_score=0
-    local total_score=0
-    
-    # 1. CPU超售检测（cpubench 的 scale / 逻辑核心，外加 steal）
-    if [[ "$CPU_BENCH_OK" -eq 1 && "$actual_efficiency" != "0" ]]; then
-        local efficiency_percent steal_int
-        efficiency_percent=$(awk -v s="$actual_efficiency" -v c="$cores" 'BEGIN { if (c < 1) c = 1; printf "%d", (s / c) * 100 }')
-        steal_int=$(awk -v s="${STEAL_PCT:-0}" 'BEGIN { printf "%d", s+0 }')
+    echo -e "\n\033[1;35m━━ 资源争用评估 ━━\033[0m"
+
+    # 最严重的有效指标决定综合等级，低值仅表示风险，不单独证明超售。
+    local severity=0 reasons="" missing=0 efficiency_percent steal_level mem_gbs
+    if [[ "$CPU_BENCH_OK" -eq 1 ]]; then
+        efficiency_percent=$(awk -v s="$actual_efficiency" -v c="$cores" 'BEGIN { if (c < 1) c = 1; printf "%d", s / c * 100 }')
         [[ "$efficiency_percent" =~ ^[0-9]+$ ]] || efficiency_percent=0
+        if [[ "$cores" -gt 1 ]]; then
+            echo "  CPU扩展效率: ${efficiency_percent}%（scale ${actual_efficiency} / ${cores} 线程）"
+            if (( efficiency_percent < 50 )); then
+                echo "  CPU扩展效率: 很低，可能限速、争用或受超线程影响"
+                (( severity < 3 )) && severity=3
+                reasons="${reasons} CPU扩展效率过低;"
+            elif (( efficiency_percent < 70 )); then
+                echo "  CPU扩展效率: 偏低，可能限速、争用或受超线程影响"
+                (( severity < 2 )) && severity=2
+                reasons="${reasons} CPU扩展效率偏低;"
+            elif (( efficiency_percent < 85 )); then
+                echo "  CPU扩展效率: 一般，可能受超线程或资源争用影响"
+                (( severity < 1 )) && severity=1
+                reasons="${reasons} CPU扩展效率一般;"
+            else
+                echo "  CPU扩展效率: 良好"
+            fi
+        fi
+        echo "  CPU steal: ${STEAL_PCT}%"
+        steal_level=$(awk -v s="${STEAL_PCT:-0}" 'BEGIN { if (s >= 10) print 3; else if (s >= 4) print 2; else print 0 }')
+        if (( steal_level == 3 )); then
+            echo "  steal 很高 - 宿主机 CPU 争用严重，可能超售"
+            (( severity < 3 )) && severity=3
+            reasons="${reasons} CPU steal 很高;"
+        elif (( steal_level == 2 )); then
+            echo "  steal 偏高 - 宿主机 CPU 可能存在争用"
+            (( severity < 2 )) && severity=2
+            reasons="${reasons} CPU steal 偏高;"
+        fi
+    else
+        echo "  CPU 基准未完成，跳过 CPU 评估"
+        missing=1
+    fi
 
-        echo "CPU扩展效率: ${efficiency_percent}%（scale ${actual_efficiency} / ${cores} 线程）"
-        echo "CPU steal: ${STEAL_PCT}%"
-
-        if [[ $efficiency_percent -ge 85 ]]; then
-            echo "CPU扩展效率: 优秀 - 无超售迹象"
-            cpu_score=3
-        elif [[ $efficiency_percent -ge 70 ]]; then
-            echo "CPU扩展效率: 良好 - 轻度超售，或只是超线程在分执行单元"
-            cpu_score=2
-        elif [[ $efficiency_percent -ge 50 ]]; then
-            echo "CPU扩展效率: 一般 - 中度超售或被限速"
-            cpu_score=1
+    if (( MEMORY_BANDWIDTH > 0 )); then
+        mem_gbs=$(awk -v m="$MEMORY_BANDWIDTH" 'BEGIN { printf "%.2f", m / 1024 }')
+        if (( MEMORY_BANDWIDTH <= 3 * 1024 )); then
+            echo "  内存带宽: 较低 (${mem_gbs} GB/s) - 可能存在资源限制或争用"
+            (( severity < 3 )) && severity=3
+            reasons="${reasons} 内存带宽较低;"
+        elif (( MEMORY_BANDWIDTH <= 8 * 1024 )); then
+            echo "  内存带宽: 一般 (${mem_gbs} GB/s)"
+            (( severity < 2 )) && severity=2
+            reasons="${reasons} 内存带宽一般;"
+        elif (( MEMORY_BANDWIDTH <= 15 * 1024 )); then
+            echo "  内存带宽: 良好 (${mem_gbs} GB/s)"
+            (( severity < 1 )) && severity=1
+            reasons="${reasons} 内存带宽偏低;"
         else
-            echo "CPU扩展效率: 差 - 严重超售或被限速"
-            cpu_score=0
-        fi
-        if [[ $steal_int -ge 10 ]]; then
-            echo "steal 很高 - 宿主机很可能在超卖 CPU"
-            cpu_score=0
-        elif [[ $steal_int -ge 4 && $cpu_score -gt 0 ]]; then
-            echo "steal 高于几个百分点 - 有超卖迹象，评分下调"
-            cpu_score=$((cpu_score - 1))
+            echo "  内存带宽: 良好 (${mem_gbs} GB/s)"
         fi
     else
-        echo "CPU 基准没有跑成，跳过 CPU 超售判断"
-        cpu_score=1
+        echo "  内存带宽未测得，跳过评估"
+        missing=1
     fi
-    
-    # 2. 内存超售检测
-    local mem_used=$(free -m | awk '/Mem:/ {printf "%.1f", $3/$2*100}')
-    local swap_used=$(free -m | awk '/Swap:/ {if ($2 == 0) print "0"; else printf "%.1f", $3/$2*100}')
-    
-    # 内存带宽评估
-    local mem_bandwidth_gbs=$(echo "scale=2; $MEMORY_BANDWIDTH / 1024" | bc)
-    local mem_bandwidth_score=0
-    
-    if [ $(echo "$mem_bandwidth_gbs > 15" | bc -l) -eq 1 ]; then
-        echo "内存带宽: 优秀 (${mem_bandwidth_gbs} GB/s) - 无超售迹象"
-        mem_bandwidth_score=3
-    elif [ $(echo "$mem_bandwidth_gbs > 8" | bc -l) -eq 1 ]; then
-        echo "内存带宽: 良好 (${mem_bandwidth_gbs} GB/s) - 轻度超售可能"
-        mem_bandwidth_score=2 
-    elif [ $(echo "$mem_bandwidth_gbs > 3" | bc -l) -eq 1 ]; then
-        echo "内存带宽: 普通 (${mem_bandwidth_gbs} GB/s) - 重度超售可能"
-        mem_bandwidth_score=1 
+
+    if (( DISK_READ_OK )); then
+        if (( DISK_IOPS_STR <= 1000 )); then
+            echo "  数据库查询性能: 较低 (${read_iops_formatted} IOPS) - 可能存在限制或争用"
+            (( severity < 3 )) && severity=3
+            reasons="${reasons} 随机读 IOPS 较低;"
+        elif (( DISK_IOPS_STR <= 3000 )); then
+            echo "  数据库查询性能: 一般 (${read_iops_formatted} IOPS)"
+            (( severity < 2 )) && severity=2
+            reasons="${reasons} 随机读 IOPS 一般;"
+        elif (( DISK_IOPS_STR <= 10000 )); then
+            echo "  数据库查询性能: 良好 (${read_iops_formatted} IOPS)"
+            (( severity < 1 )) && severity=1
+            reasons="${reasons} 随机读 IOPS 偏低;"
+        else
+            echo "  数据库查询性能: 优秀 (${read_iops_formatted} IOPS)"
+        fi
     else
-        echo "内存带宽: 较差 (${mem_bandwidth_gbs} GB/s) - 可能严重超售"
-        mem_bandwidth_score=0
-    fi 
-    
-    memory_score=$(( mem_bandwidth_score + mem_usage_score + swap_score ))
-    
-    # 3. IO超售检测
-    # 数据库查询性能评估 (4K随机读)
-    if [[ $DISK_IOPS_STR -gt 10000 ]]; then
-        echo "数据库查询性能: 优秀 ($(format_number $read_iops_formatted) IOPS) - 无超售迹象"
-        io_score=3
-    elif [[ $DISK_IOPS_STR -gt 3000 ]]; then
-        echo "数据库查询性能: 良好 ($(format_number $read_iops_formatted) IOPS) - 轻度超售可能"
-        io_score=2
-    elif [[ $DISK_IOPS_STR -gt 1000 ]]; then
-        echo "数据库查询性能: 一般 ($(format_number $read_iops_formatted) IOPS) - 可能超售"
-        io_score=1
-    else
-        echo "数据库查询性能: 差 ($(format_number $read_iops_formatted) IOPS) - 可能严重超售"
-        io_score=0
+        echo "  随机读未测得，跳过评估"
+        missing=1
     fi
-    
-    # 媒体上传性能评估 (64K顺序写)
-    if [[ $write_mbps_formatted -gt 500 ]]; then  # >500 MB/s
-        echo "媒体上传性能: 优秀 ($(format_number $((write_mbps_formatted))) MB/s) - 无超售迹象"
-        io_score=$((io_score + 1))
-    elif [[ $write_mbps_formatted -gt 200 ]]; then  # >200 MB/s
-        echo "媒体上传性能: 良好 ($(format_number $((write_mbps_formatted))) MB/s) - 轻度超售可能"
-        io_score=$((io_score + 1))
+
+    if (( DISK_WRITE_OK )); then
+        if (( DISK_WRITE_MBPS <= 50 )); then
+            echo "  媒体上传性能: 很低 (${write_mbps_formatted} MB/s) - 可能存在限制或争用"
+            (( severity < 3 )) && severity=3
+            reasons="${reasons} 顺序写入速度很低;"
+        elif (( DISK_WRITE_MBPS <= 200 )); then
+            echo "  媒体上传性能: 较低 (${write_mbps_formatted} MB/s) - 可能存在限制或争用"
+            (( severity < 2 )) && severity=2
+            reasons="${reasons} 顺序写入速度较低;"
+        elif (( DISK_WRITE_MBPS <= 500 )); then
+            echo "  媒体上传性能: 良好 (${write_mbps_formatted} MB/s)"
+        else
+            echo "  媒体上传性能: 优秀 (${write_mbps_formatted} MB/s)"
+        fi
     else
-        echo "媒体上传性能: 差 ($(format_number $((write_mbps_formatted))) MB/s) - 可能超售"
+        echo "  顺序写未测得，跳过评估"
+        missing=1
     fi
-    
-    # 综合评分
-    total_score=$((cpu_score + memory_score + io_score))
-    local oversell_level=""
-    if [[ $total_score -ge 9 ]]; then
-        oversell_level="非常好"
-    elif [[ $total_score -ge 8 ]]; then
-        oversell_level="无超售迹象"
-    elif [[ $total_score -ge 6 ]]; then
-        oversell_level="轻度超售可能"
-    elif [[ $total_score -ge 3 ]]; then
-        oversell_level="中度超售"
-    else
-        oversell_level="发现远古巨瘦 您已严重超售"
+
+    local oversell_level
+    case "$severity" in
+        3) oversell_level="严重资源争用或限制风险（疑似严重超售）" ;;
+        2) oversell_level="中度资源争用或限制风险" ;;
+        1) oversell_level="轻度资源争用或限制风险" ;;
+        *) if (( missing )); then oversell_level="数据不完整，无法确定"; else oversell_level="未发现明显异常"; fi ;;
+    esac
+    echo -e "\n\033[1;35m  综合结论: ${oversell_level}\033[0m"
+    if [[ -n "$reasons" ]]; then
+        echo "  触发指标:"
+        printf '%s\n' "$reasons" | tr ';' '\n' | awk 'NF { sub(/^ +/, ""); print "    - " $0 }'
     fi
-    
-    echo -e "\n\033[1;35m超售综合评估: ${total_score}/10 - ${oversell_level}\033[0m"
+    (( missing )) && echo "  部分测试未完成，综合判断可能不完整"
+    echo "  注：按最严重的有效指标判级；低带宽或扩展效率也可能由规格限制、硬件或测试条件造成。"
 }
+
 testc() {
      
     cache_mb=$(echo "$l3_cache" | sed 's/.*\\([0-9]\\+\\) MB.*/\\1/')
