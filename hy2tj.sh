@@ -166,12 +166,12 @@ EOF
 write_clients() {
   local enc_auth enc_obfs extra link bare query node_name
   umask 077
-  enc_auth="$(urlencode "$AUTH")"
+  enc_auth="$(urlencode "$AUTH")" || return 1
   extra=""
-  query="sni=$(urlencode "$SNI")"
+  query="sni=$(urlencode "$SNI")" || return 1
   node_name="HY2"
   if [ "${OBFS_ENABLED:-0}" = "1" ]; then
-    enc_obfs="$(urlencode "$OBFS")"
+    enc_obfs="$(urlencode "$OBFS")" || return 1
     query="obfs=gecko&obfs-password=${enc_obfs}&${query}"
     node_name="HY2-Gecko"
   fi
@@ -181,7 +181,7 @@ write_clients() {
   fi
   link="hysteria2://${enc_auth}@${IP}:${PORT}/?${query}${extra}#${node_name}"
   echo "$link" > "$BASE/neko.txt"
-  qrencode -o "$BASE/hy2.png" "$link"
+  qrencode -o "$BASE/hy2.png" "$link" || return 1
   bare="${IP//[\[\]]/}"
   # JSON flow mappings are also valid YAML; quoting protects custom passwords and IPv6.
   python3 - "$bare" "$PORT" "$AUTH" "$SNI" "$CERT_MODE" "${OBFS_ENABLED:-0}" "${OBFS:-}" "${HOP:-0}" "${HOP_START:-}" "${HOP_END:-}" > "$BASE/clash-mate.yaml" <<'PY'
@@ -322,8 +322,10 @@ install_hysteria() {
   read -r -p "服务器地址 [自动检测: $IP]: " in_ip
   [ -n "$in_ip" ] && IP="$in_ip"
 
-  read -r -p "证书类型 1=自签 2=ACME域名 [1]: " in_cert
+  read -r -p "证书类型 1=自签 2=ACME域名 0=返回上级菜单 [1]: " in_cert || return 1
   in_cert="${in_cert:-1}"
+  [[ "$in_cert" != 0 ]] || { echo "已取消安装；已下载的内核和依赖保留。"; return 125; }
+  [[ "$in_cert" = 1 || "$in_cert" = 2 ]] || { echo "请选择 1、2 或 0"; return 1; }
   DOMAIN=""
   EMAIL=""
 
@@ -449,9 +451,10 @@ update_bin() {
 
 service_op() {
   load_meta
-  echo "1 启动  2 关闭  3 重启"
-  read -r -p "选择: " op
+  echo "1 启动  2 关闭  3 重启  0 返回上级菜单"
+  read -r -p "选择: " op || return
   case "$op" in
+    0|q|Q) return 125 ;;
     1) systemctl start hysteria.service ;;
     2) systemctl stop hysteria.service ;;
     3) systemctl restart hysteria.service ;;
@@ -499,9 +502,11 @@ change_hop() {
   fi
   echo "1 开启或修改"
   echo "2 关闭"
-  read -r -p "选择 [回车取消]: " op
+  echo "0 返回上级菜单"
+  read -r -p "选择 [回车返回]: " op || return
 
   case "$op" in
+    0|q|Q|'') return 125 ;;
     1)
       read -r -p "起始端口 [20000]: " HOP_START
       HOP_START="${HOP_START:-20000}"
@@ -560,9 +565,11 @@ switch_obfs() {
   fi
   echo "1 开启或修改 Gecko 混淆"
   echo "2 关闭 Gecko 混淆"
-  read -r -p "选择 [回车取消]: " op
+  echo "0 返回上级菜单"
+  read -r -p "选择 [回车返回]: " op || return
 
   case "$op" in
+    0|q|Q|'') return 125 ;;
     1)
       OBFS_ENABLED=1
       read -r -p "Gecko 混淆密码 [回车保留当前/随机]: " in_obfs
@@ -617,12 +624,82 @@ refresh_ipv6() {
   show_info
 }
 
+# SNI 是客户端 TLS 参数；自签模式跳过证书校验，不必重签证书或重启服务。
+change_sni() {
+  local SNI new_sni old_sni domain temp stage backup file answer restore_ok
+  local -a files=(meta.env neko.txt hy2.png clash-mate.yaml)
+  load_meta
+  old_sni="$SNI"
+  echo "当前 SNI: $old_sni（证书: $CERT_MODE）"
+  read -r -p "新 SNI 域名 [回车或 0 返回]: " new_sni || return 1
+  [[ -n "$new_sni" && "$new_sni" != 0 ]] || { echo "已取消"; return 125; }
+  new_sni="$(mieru_normalize_address "$new_sni")" || return 1
+  if ! python3 - "$new_sni" <<'PY'
+import ipaddress, sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(0)
+print('SNI 必须是域名，不能是 IP 地址', file=sys.stderr)
+sys.exit(1)
+PY
+  then return 1; fi
+  if [ "$CERT_MODE" = acme ]; then
+    domain="$(mieru_normalize_address "${DOMAIN:-}")" || return 1
+    if [ "${new_sni,,}" != "${domain,,}" ]; then
+      echo "ACME 证书模式下，SNI 必须与证书域名 $domain 一致；如需更换域名请使用证书菜单。"
+      return 1
+    fi
+  fi
+  if [ "$new_sni" = "$old_sni" ]; then echo "SNI 没有变化"; return 0; fi
+  echo "新 SNI: $new_sni"
+  if [ "$CERT_MODE" = self ]; then
+    echo "只更新客户端 SNI；保留现有自签证书，其证书名不会改变，客户端仍需跳过证书验证。"
+  fi
+  read -r -p "确认更新链接、配置和二维码? [y/N]: " answer || return 1
+  [[ "$answer" = [yY] ]] || { echo "已取消"; return 0; }
+  umask 077
+  temp="$(mktemp -d "$BASE/.sni.XXXXXXXX")" || return 1
+  stage="$temp/stage"; backup="$temp/backup"
+  mkdir "$stage" "$backup" || { rm -rf "$temp"; return 1; }
+  for file in "${files[@]}"; do
+    if [ -f "$BASE/$file" ]; then
+      cp -p "$BASE/$file" "$backup/$file" || { echo "备份失败"; rm -rf "$temp"; return 1; }
+    fi
+  done
+  SNI="$new_sni"
+  if ! ( BASE="$stage"; META="$stage/meta.env"; save_meta && write_clients ); then
+    echo "生成配置或二维码失败，原配置未改变。"; rm -rf "$temp"; return 1
+  fi
+  for file in "${files[@]}"; do
+    if ! cp -p "$stage/$file" "$BASE/$file"; then
+      echo "保存失败，正在恢复旧配置。"
+      restore_ok=1
+      for file in "${files[@]}"; do
+        if [ -f "$backup/$file" ]; then
+          cp -p "$backup/$file" "$BASE/$file" || restore_ok=0
+        else
+          rm -f "$BASE/$file" || restore_ok=0
+        fi
+      done
+      if [ "$restore_ok" = 1 ]; then rm -rf "$temp"; else echo "恢复未完全成功，备份保留在 $backup。"; fi
+      return 1
+    fi
+  done
+  rm -rf "$temp"
+  echo "SNI 已更新；服务端配置和证书未改变，无需重启。旧客户端需更新配置。"
+  show_info
+}
+
 switch_cert() {
   load_meta
   echo "1 自签 www.bing.com"
   echo "2 ACME 域名证书"
-  read -r -p "选择: " op
-  if [ "$op" = "1" ]; then
+  echo "0 返回上级菜单"
+  read -r -p "选择: " op || return
+  if [[ "$op" = 0 || "$op" = q || "$op" = Q || -z "$op" ]]; then
+    return 125
+  elif [ "$op" = "1" ]; then
     CERT_MODE="self"
     SNI="$SNI_DEFAULT"
     DOMAIN=""
@@ -646,6 +723,7 @@ switch_cert() {
   show_info
 }
 hy2_menu() {
+local menu_action result
 while true; do
   echo
   echo "========== Hysteria2 Gecko =========="
@@ -654,7 +732,7 @@ while true; do
   echo "1  安装"
   echo "2  卸载"
   echo "3  查看链接和二维码"
-  echo "4  退出"
+  echo "4  返回协议菜单（也可输入 0）"
   echo "5  更新 Hysteria 内核"
   echo "6  启动 / 关闭 / 重启"
   echo "7  查看状态和日志"
@@ -666,8 +744,10 @@ while true; do
   echo "13 切换自签 / ACME 证书"
   echo "14 IPV6"
   echo "15 开关 Gecko 混淆"
+  echo "16 修改 SNI"
   read -r -p "选择: " choice || return
 
+  result=0
   case "$choice" in
     1)  ( install_hysteria ) ;;
     2)  ( uninstall_hysteria ) ;;
@@ -684,11 +764,14 @@ while true; do
     13) ( switch_cert ) ;;
     14) ( refresh_ipv6 ) ;;
     15) ( switch_obfs ) ;;
+    16) ( change_sni ) ;;
     *)  echo "无效选项" ;;
-  esac
+  esac || result=$?
+  [ "$result" -ne 125 ] || continue
 
   echo
-  read -r -p "按回车返回菜单..." _ || return
+  read -r -p "回车返回 HY2 菜单，输入 0 返回协议菜单: " menu_action || return 0
+  [[ "$menu_action" = 0 || "$menu_action" = q || "$menu_action" = Q ]] && return 0
 done
 }
 
@@ -859,9 +942,10 @@ install_mieru() {
     IP="$in_ip"
   fi
   IP="$(mieru_normalize_address "$IP")" || return 1
-  echo "传输方式: 1 仅 TCP  2 仅 UDP  3 TCP + UDP"
+  echo "传输方式: 1 仅 TCP  2 仅 UDP  3 TCP + UDP  0 返回上级菜单"
   read -r -p "选择 [3]: " mode || return 1
   mode="${mode:-3}"
+  [[ "$mode" = 0 || "$mode" = q || "$mode" = Q ]] && { echo "已取消安装"; return 125; }
   [[ "$mode" = 1 || "$mode" = 2 || "$mode" = 3 ]] || { echo "无效选项"; return 1; }
   echo "默认使用随机的 10 个连续端口；也可输入单个端口或范围，如 30001-31200。"
   if [[ "$mode" = 1 || "$mode" = 3 ]]; then
@@ -1052,13 +1136,14 @@ change_mieru() {
   old_tcp_user="$TCP_USER"; old_tcp_pass="$TCP_PASS"; old_udp_user="$UDP_USER"; old_udp_pass="$UDP_PASS"
 
   if [ "$kind" = mode ]; then
-    echo "1 仅 TCP  2 仅 UDP  3 TCP + UDP"
-    read -r -p "选择传输方式 [回车取消]: " mode || { rm -rf "$temp"; return 1; }
+    echo "1 仅 TCP  2 仅 UDP  3 TCP + UDP  0 返回上级菜单"
+    read -r -p "选择传输方式 [回车返回]: " mode || { rm -rf "$temp"; return 1; }
     case "$mode" in
       1) UDP_PORT=""; UDP_USER=""; UDP_PASS="" ;;
       2) TCP_PORT=""; TCP_USER=""; TCP_PASS="" ;;
       3) ;;
-      *) echo "已取消"; rm -rf "$temp"; return 0 ;;
+      0|q|Q|'') echo "已取消"; rm -rf "$temp"; return 125 ;;
+      *) echo "无效选项"; rm -rf "$temp"; return 1 ;;
     esac
     if [[ "$mode" = 1 || "$mode" = 3 ]] && [ -z "$TCP_PORT" ]; then
       TCP_PORT="$(mieru_random_range TCP)" || { rm -rf "$temp"; return 1; }
@@ -1211,13 +1296,14 @@ change_mieru_address() {
   old_ip="${data[0]}"; TCP_PORT="${data[1]}"; UDP_PORT="${data[2]}"
   TCP_USER="${data[3]}"; TCP_PASS="${data[4]}"; UDP_USER="${data[5]}"; UDP_PASS="${data[6]}"
   echo "当前节点地址: $old_ip"
-  echo "1 自动检测公网 IPv6  2 自动检测公网 IPv4  3 手动输入地址或域名"
-  read -r -p "选择 [回车取消]: " choice || { rm -rf "$temp"; return 1; }
+  echo "1 自动检测公网 IPv6  2 自动检测公网 IPv4  3 手动输入地址或域名  0 返回上级菜单"
+  read -r -p "选择 [回车返回]: " choice || { rm -rf "$temp"; return 1; }
   case "$choice" in
     1) address="$(mieru_detect_address 6)" || { rm -rf "$temp"; return 1; } ;;
     2) address="$(mieru_detect_address 4)" || { rm -rf "$temp"; return 1; } ;;
     3) read -r -p "服务器 IPv4 / IPv6 地址或域名: " address || { rm -rf "$temp"; return 1; } ;;
-    *) echo "已取消"; rm -rf "$temp"; return 0 ;;
+    0|q|Q|'') echo "已取消"; rm -rf "$temp"; return 125 ;;
+    *) echo "无效选项"; rm -rf "$temp"; return 1 ;;
   esac
   IP="$(mieru_normalize_address "$address")" || { rm -rf "$temp"; return 1; }
   if [ "$IP" = "$old_ip" ]; then echo "地址没有变化"; rm -rf "$temp"; return 0; fi
@@ -1252,15 +1338,16 @@ change_mieru_address() {
 }
 
 mieru_menu() {
-  local choice op
+  local choice op menu_action result
   while :; do
     echo
     echo "========== Mieru =========="
-    echo "1 安装 Mieru  2 卸载  3 查看配置和二维码  4 返回"
+    echo "1 安装 Mieru  2 卸载  3 查看配置和二维码  4 返回协议菜单（也可输入 0）"
     echo "5 更新 mita  6 启动 / 关闭 / 重启  7 状态和日志"
     echo "8 修改 TCP / UDP 端口或范围  9 修改账号 / 密码  10 切换传输方式"
     echo "11 切换节点地址 IPv4 / IPv6 / 域名"
     read -r -p "选择: " choice || return
+    result=0
     case "$choice" in
       1) ( install_mieru ) ;;
       2) ( uninstall_mieru ) ;;
@@ -1268,9 +1355,10 @@ mieru_menu() {
       4|0|q|Q) return ;;
       5) ( [ -f "$MIERU_BASE/server.json" ] || { echo "还没有安装"; exit 1; }; mieru_package && systemctl restart mita.service && mita status ) ;;
       6) ( [ -f "$MIERU_BASE/server.json" ] || { echo "还没有安装"; exit 1; }
-           echo "1 启动  2 关闭  3 重启"
-           read -r -p "选择: " op
+           echo "1 启动  2 关闭  3 重启  0 返回上级菜单"
+           read -r -p "选择: " op || exit 0
            case "$op" in
+             0|q|Q) exit 125 ;;
              1) systemctl start mita.service && mita start ;;
              2) mita stop ;;
              3) mita stop && mita start ;;
@@ -1282,8 +1370,10 @@ mieru_menu() {
       10) ( change_mieru mode ) ;;
       11) ( change_mieru_address ) ;;
       *) echo "无效选项" ;;
-    esac
-    read -r -p "按回车返回菜单..." _ || return
+    esac || result=$?
+    [ "$result" -ne 125 ] || continue
+    read -r -p "回车返回 Mieru 菜单，输入 0 返回协议菜单: " menu_action || return 0
+    [[ "$menu_action" = 0 || "$menu_action" = q || "$menu_action" = Q ]] && return 0
   done
 }
 
