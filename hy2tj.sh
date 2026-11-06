@@ -693,6 +693,50 @@ done
 }
 
 # mieru 使用官方 mita 软件包和独立配置，不覆盖已有的 mita 安装。
+mieru_normalize_address() {
+  python3 - "$1" <<'PY'
+import ipaddress, re, sys
+value = sys.argv[1].strip()
+try:
+    if not value or '%' in value:
+        raise ValueError('地址为空或包含 IPv6 区域标识')
+    if value.startswith('[') or value.endswith(']'):
+        if not (value.startswith('[') and value.endswith(']')):
+            raise ValueError('IPv6 方括号不匹配')
+        address = ipaddress.IPv6Address(value[1:-1])
+    else:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            if ':' in value or re.fullmatch(r'[0-9.]+', value):
+                raise ValueError('无效的 IP 地址')
+            name = value.encode('idna').decode('ascii').rstrip('.')
+            labels = name.split('.')
+            if len(name) > 253 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label) for label in labels):
+                raise ValueError('无效的域名')
+            address = name
+    print(address)
+except (ValueError, UnicodeError) as e:
+    print('服务器地址无效：%s' % e, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+mieru_detect_address() {
+  local version="$1" address normalized
+  if [ "$version" = 6 ]; then
+    address="$(curl -6 -fsSL --max-time 8 https://api64.ipify.org)" || { echo "无法检测公网 IPv6" >&2; return 1; }
+  else
+    address="$(curl -4 -fsSL --max-time 8 https://api.ipify.org)" || { echo "无法检测公网 IPv4" >&2; return 1; }
+  fi
+  normalized="$(mieru_normalize_address "$address")" || return 1
+  if ! python3 -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == int(sys.argv[2]) else 1)' "$normalized" "$version"; then
+    echo "检测结果不是有效的 IPv${version} 地址" >&2
+    return 1
+  fi
+  echo "$normalized"
+}
+
 mieru_package() {
   local tmp url asset sha_url pkg sum
   tmp="$(mktemp -d)" || return 1
@@ -738,15 +782,17 @@ PY
   return "$result"
 }
 
-mieru_random_port() {
-  local p ports avoid="${1:-}"
-  ports="$(ss -lntu)" || { echo "无法检查已占用端口" >&2; return 1; }
-  while :; do
-    p=$((RANDOM % 55536 + 10000))
-    if [ "$p" != "$avoid" ] && ! printf '%s\n' "$ports" | awk '{print $5}' | grep -Eq "[:.]${p}$"; then
-      echo "$p"; return
+mieru_random_range() {
+  local protocol="$1" start range i
+  for ((i=0; i<100; i++)); do
+    start=$((RANDOM % 50000 + 10000))
+    range="${start}-$((start + 9))"
+    if mieru_check_port "$range" "" "$protocol" >/dev/null; then
+      echo "$range"; return
     fi
   done
+  echo "无法找到空闲的 $protocol 端口范围" >&2
+  return 1
 }
 
 mieru_write_clients() {
@@ -759,8 +805,12 @@ nodes = []
 for name, protocol, port, user, password in (
         ('mt-hc', 'TCP', tcp_port, tcp_user, tcp_pass),
         ('mu-hc', 'UDP', udp_port, udp_user, udp_pass)):
-    nodes.append({'name': name, 'type': 'mieru', 'transport': protocol,
-                  'port': int(port), 'server': server, 'username': user, 'password': password})
+    if not port:
+        continue
+    node = {'name': name, 'type': 'mieru', 'transport': protocol,
+            'server': server, 'username': user, 'password': password}
+    node['port-range' if '-' in port else 'port'] = port if '-' in port else int(port)
+    nodes.append(node)
     query = urllib.parse.urlencode({'profile': name, 'port': port, 'protocol': protocol})
     link = 'mierus://{}:{}@{}?{}'.format(urllib.parse.quote(user, safe=''),
         urllib.parse.quote(password, safe=''), authority, query)
@@ -770,8 +820,8 @@ with open(os.path.join(base, 'clash-mate.yaml'), 'w', encoding='utf-8') as f:
     f.write('proxies:\n' + ''.join('  - ' + json.dumps(node, ensure_ascii=False) + '\n' for node in nodes))
 PY
   [ $? -eq 0 ] || return 1
-  qrencode -o "$MIERU_BASE/tcp.png" < "$MIERU_BASE/tcp.txt" || return 1
-  qrencode -o "$MIERU_BASE/udp.png" < "$MIERU_BASE/udp.txt" || return 1
+  if [ -n "$TCP_PORT" ]; then qrencode -o "$MIERU_BASE/tcp.png" < "$MIERU_BASE/tcp.txt" || return 1; fi
+  if [ -n "$UDP_PORT" ]; then qrencode -o "$MIERU_BASE/udp.png" < "$MIERU_BASE/udp.txt" || return 1; fi
 }
 
 show_mieru() {
@@ -780,6 +830,7 @@ show_mieru() {
   cat "$MIERU_BASE/clash-mate.yaml"
   local protocol
   for protocol in tcp udp; do
+    [ -f "$MIERU_BASE/$protocol.txt" ] || continue
     echo
     echo "${protocol^^} 分享链接 (mierus):"
     cat "$MIERU_BASE/$protocol.txt"
@@ -787,6 +838,9 @@ show_mieru() {
     echo "二维码图片: $MIERU_BASE/$protocol.png"
   done
   echo "配置文件: $MIERU_BASE/clash-mate.yaml"
+  if [ -f "$MIERU_BASE/tcp.txt" ] && [ -f "$MIERU_BASE/udp.txt" ]; then
+    echo "提示: mita 账户不按传输方式隔离，两个账户均可使用 TCP 和 UDP 监听端口。"
+  fi
   echo "提示: mierus 链接为官方简单分享格式，客户端需支持该格式。"
 }
 
@@ -797,24 +851,47 @@ install_mieru() {
   fi
   need_pkgs || return 1
   detect_ip
-  local in_ip TCP_PORT UDP_PORT TCP_USER UDP_USER TCP_PASS UDP_PASS
-  read -r -p "服务器地址 [自动检测: $IP]: " in_ip || return 1
-  [ -z "$in_ip" ] || IP="$in_ip"
-  TCP_PORT="$(mieru_random_port)" || return 1
-  UDP_PORT="$(mieru_random_port "$TCP_PORT")" || return 1
-  TCP_USER="tcp_$(openssl rand -hex 4)"; UDP_USER="udp_$(openssl rand -hex 4)"
-  TCP_PASS="$(randpw)"; UDP_PASS="$(randpw)"
-  [ -n "$TCP_PASS" ] && [ -n "$UDP_PASS" ] || { echo "随机密码生成失败"; return 1; }
+  local in_ip mode port TCP_PORT="" UDP_PORT="" TCP_USER="" UDP_USER="" TCP_PASS="" UDP_PASS=""
+  read -r -p "服务器地址 [自动检测: $IP；输入 6 自动检测 IPv6]: " in_ip || return 1
+  if [ "$in_ip" = 6 ]; then
+    IP="$(mieru_detect_address 6)" || return 1
+  elif [ -n "$in_ip" ]; then
+    IP="$in_ip"
+  fi
+  IP="$(mieru_normalize_address "$IP")" || return 1
+  echo "传输方式: 1 仅 TCP  2 仅 UDP  3 TCP + UDP"
+  read -r -p "选择 [3]: " mode || return 1
+  mode="${mode:-3}"
+  [[ "$mode" = 1 || "$mode" = 2 || "$mode" = 3 ]] || { echo "无效选项"; return 1; }
+  echo "默认使用随机的 10 个连续端口；也可输入单个端口或范围，如 30001-31200。"
+  if [[ "$mode" = 1 || "$mode" = 3 ]]; then
+    TCP_PORT="$(mieru_random_range TCP)" || return 1
+    read -r -p "TCP 端口或范围 [$TCP_PORT]: " port || return 1
+    TCP_PORT="$(mieru_normalize_port "${port:-$TCP_PORT}")" || return 1
+    mieru_check_port "$TCP_PORT" "" TCP || return 1
+    TCP_USER="tcp_$(openssl rand -hex 4)"; TCP_PASS="$(randpw)"
+    [ -n "$TCP_USER" ] && [ -n "$TCP_PASS" ] || return 1
+  fi
+  if [[ "$mode" = 2 || "$mode" = 3 ]]; then
+    UDP_PORT="$(mieru_random_range UDP)" || return 1
+    read -r -p "UDP 端口或范围 [$UDP_PORT]: " port || return 1
+    UDP_PORT="$(mieru_normalize_port "${port:-$UDP_PORT}")" || return 1
+    mieru_check_port "$UDP_PORT" "" UDP || return 1
+    UDP_USER="udp_$(openssl rand -hex 4)"; UDP_PASS="$(randpw)"
+    [ -n "$UDP_USER" ] && [ -n "$UDP_PASS" ] || return 1
+  fi
   umask 077
   mkdir -p "$MIERU_BASE" || return 1
   python3 - "$MIERU_BASE/server.json" "$TCP_PORT" "$UDP_PORT" "$TCP_USER" "$TCP_PASS" "$UDP_USER" "$UDP_PASS" <<'PY'
 import json, sys
 path, tcp_port, udp_port, tcp_user, tcp_pass, udp_user, udp_pass = sys.argv[1:]
-config = {'portBindings': [{'port': int(tcp_port), 'protocol': 'TCP'},
-                           {'port': int(udp_port), 'protocol': 'UDP'}],
-          'users': [{'name': tcp_user, 'password': tcp_pass},
-                    {'name': udp_user, 'password': udp_pass}],
-          'loggingLevel': 'INFO'}
+config = {'portBindings': [], 'users': [], 'loggingLevel': 'INFO'}
+for protocol, port, user, password in (('TCP', tcp_port, tcp_user, tcp_pass), ('UDP', udp_port, udp_user, udp_pass)):
+    if port:
+        binding = {'protocol': protocol}
+        binding['portRange' if '-' in port else 'port'] = port if '-' in port else int(port)
+        config['portBindings'].append(binding)
+        config['users'].append({'name': user, 'password': password})
 with open(path, 'w', encoding='utf-8') as f:
     json.dump(config, f, indent=2)
 PY
@@ -833,8 +910,11 @@ PY
     return 1
   fi
   show_mieru
-  echo "请在防火墙和云安全组放行 TCP $TCP_PORT、UDP $UDP_PORT。"
-  echo "两个账户均可用于这两个监听端口；请确保客户端和服务器时间同步。"
+  [ -z "$TCP_PORT" ] || echo "请放行 TCP $TCP_PORT。"
+  [ -z "$UDP_PORT" ] || echo "请放行 UDP $UDP_PORT。"
+  echo "请在防火墙及云安全组放行整个范围，并确保客户端和服务器时间同步。"
+  echo "使用 IPv6 时还需确认服务器公网 IPv6 可达且服务支持 IPv6 监听。"
+  echo "Mieru 在新建连接时选择端口，不会在连接中周期性跳端口。"
 }
 
 uninstall_mieru() {
@@ -864,16 +944,25 @@ try:
     with open(sys.argv[2], encoding='utf-8') as f:
         lines = f.read().splitlines()
     nodes = [json.loads(line.strip()[2:]) for line in lines if line.strip().startswith('- ')]
-    tcp, = [n for n in nodes if n.get('type') == 'mieru' and n.get('transport') == 'TCP']
-    udp, = [n for n in nodes if n.get('type') == 'mieru' and n.get('transport') == 'UDP']
-    if tcp['server'] != udp['server'] or tcp['username'] == udp['username']:
+    selected = {}
+    for node in nodes:
+        if node.get('type') != 'mieru' or node.get('transport') not in ('TCP', 'UDP') or node['transport'] in selected:
+            raise ValueError('节点类型或传输方式不正确')
+        selected[node['transport']] = node
+    if not selected:
+        raise ValueError('没有 mieru 节点')
+    if len({node['server'] for node in selected.values()}) != 1 or len({node['username'] for node in selected.values()}) != len(selected):
         raise ValueError('节点地址或用户名不匹配')
-    for node in (tcp, udp):
-        bindings = [b for b in config['portBindings'] if b.get('protocol') == node['transport'] and b.get('port') == node['port']]
+    for node in selected.values():
+        key = 'portRange' if 'port-range' in node else 'port'
+        port = node.get('port-range', node.get('port'))
+        bindings = [b for b in config['portBindings'] if b.get('protocol') == node['transport'] and b.get(key) == port]
         users = [u for u in config['users'] if u.get('name') == node['username'] and u.get('password') == node['password']]
-        if len(bindings) != 1 or len(users) != 1:
+        if port is None or len(bindings) != 1 or len(users) != 1:
             raise ValueError('服务端配置与客户端节点不一致')
-    values = [tcp['server'], tcp['port'], udp['port'], tcp['username'], tcp['password'], udp['username'], udp['password']]
+    tcp, udp = selected.get('TCP', {}), selected.get('UDP', {})
+    port = lambda n: n.get('port-range', n.get('port', ''))
+    values = [next(iter(selected.values()))['server'], port(tcp), port(udp), tcp.get('username', ''), tcp.get('password', ''), udp.get('username', ''), udp.get('password', '')]
     for value in values:
         text = str(value)
         if '\x00' in text:
@@ -885,19 +974,37 @@ except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
 PY
 }
 
+mieru_normalize_port() {
+  local value="$1" start end
+  if [[ "$value" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]]; then
+    start=$((10#${BASH_REMATCH[1]}))
+    end=$((10#${BASH_REMATCH[3]:-${BASH_REMATCH[1]}}))
+    if (( start >= 1025 && end <= 65535 && start <= end )); then
+      if (( start == end )); then echo "$start"; else echo "$start-$end"; fi
+      return 0
+    fi
+  fi
+  echo "端口或范围必须在 1025-65535 之间，如 20000-20009" >&2
+  return 1
+}
+
 mieru_check_port() {
-  local port="$1" old="$2" protocol="$3" sockets
-  [[ "$port" =~ ^[0-9]{1,5}$ ]] || { echo "端口必须是 1025-65535 的数字"; return 1; }
-  port=$((10#$port))
-  (( port >= 1025 && port <= 65535 )) || { echo "端口必须是 1025-65535 的数字"; return 1; }
+  local port="$1" old="$2" protocol="$3" sockets start end old_start=0 old_end=0 conflict
+  port="$(mieru_normalize_port "$port")" || return 1
+  start="${port%-*}"; end="${port#*-}"
+  if [ -n "$old" ]; then
+    old="$(mieru_normalize_port "$old")" || return 1
+    old_start="${old%-*}"; old_end="${old#*-}"
+  fi
   [ "$port" = "$old" ] && return 0
   if [ "$protocol" = TCP ]; then
     sockets="$(ss -lnt)" || { echo "无法检查 TCP 端口"; return 1; }
   else
     sockets="$(ss -lnu)" || { echo "无法检查 UDP 端口"; return 1; }
   fi
-  if printf '%s\n' "$sockets" | awk '{print $5}' | grep -Eq "[:.]${port}$"; then
-    echo "$protocol 端口 $port 已被占用"
+  conflict="$(printf '%s\n' "$sockets" | awk -v a="$start" -v b="$end" -v x="$old_start" -v y="$old_end" 'NR>1 {n=split($4,p,":"); v=p[n]; if (v ~ /^[0-9]+$/ && v>=a && v<=b && (v<x || v>y)) {print v; exit}}')"
+  if [ -n "$conflict" ]; then
+    echo "$protocol 端口 $conflict 已被占用"
     return 1
   fi
 }
@@ -912,7 +1019,11 @@ mieru_rollback() {
     mita start && mita status | grep -q RUNNING || ok=0
   fi
   for file in server.json clash-mate.yaml tcp.txt udp.txt tcp.png udp.png; do
-    cp -p "$backup/$file" "$MIERU_BASE/$file" || ok=0
+    if [ -f "$backup/$file" ]; then
+      cp -p "$backup/$file" "$MIERU_BASE/$file" || ok=0
+    else
+      rm -f "$MIERU_BASE/$file" || ok=0
+    fi
   done
   if [ "$ok" = 1 ]; then
     echo "已恢复旧配置和原服务状态。"
@@ -923,7 +1034,7 @@ mieru_rollback() {
 }
 
 change_mieru() {
-  local kind="$1" temp backup stage status was_running=0 file answer in_tcp in_udp
+  local kind="$1" temp backup stage status was_running=0 file answer in_tcp in_udp mode
   local IP TCP_PORT UDP_PORT TCP_USER TCP_PASS UDP_USER UDP_PASS
   local old_tcp old_udp old_tcp_user old_tcp_pass old_udp_user old_udp_pass
   local -a data
@@ -940,24 +1051,56 @@ change_mieru() {
   old_tcp="$TCP_PORT"; old_udp="$UDP_PORT"
   old_tcp_user="$TCP_USER"; old_tcp_pass="$TCP_PASS"; old_udp_user="$UDP_USER"; old_udp_pass="$UDP_PASS"
 
-  if [ "$kind" = port ]; then
-    read -r -p "TCP 端口 [$TCP_PORT，回车不变]: " in_tcp || { rm -rf "$temp"; return 1; }
-    read -r -p "UDP 端口 [$UDP_PORT，回车不变]: " in_udp || { rm -rf "$temp"; return 1; }
-    TCP_PORT="${in_tcp:-$TCP_PORT}"; UDP_PORT="${in_udp:-$UDP_PORT}"
-    if ! mieru_check_port "$TCP_PORT" "$old_tcp" TCP || ! mieru_check_port "$UDP_PORT" "$old_udp" UDP; then
-      rm -rf "$temp"; return 1
+  if [ "$kind" = mode ]; then
+    echo "1 仅 TCP  2 仅 UDP  3 TCP + UDP"
+    read -r -p "选择传输方式 [回车取消]: " mode || { rm -rf "$temp"; return 1; }
+    case "$mode" in
+      1) UDP_PORT=""; UDP_USER=""; UDP_PASS="" ;;
+      2) TCP_PORT=""; TCP_USER=""; TCP_PASS="" ;;
+      3) ;;
+      *) echo "已取消"; rm -rf "$temp"; return 0 ;;
+    esac
+    if [[ "$mode" = 1 || "$mode" = 3 ]] && [ -z "$TCP_PORT" ]; then
+      TCP_PORT="$(mieru_random_range TCP)" || { rm -rf "$temp"; return 1; }
+      read -r -p "TCP 端口或范围 [$TCP_PORT]: " in_tcp || { rm -rf "$temp"; return 1; }
+      TCP_PORT="$(mieru_normalize_port "${in_tcp:-$TCP_PORT}")" || { rm -rf "$temp"; return 1; }
+      mieru_check_port "$TCP_PORT" "" TCP || { rm -rf "$temp"; return 1; }
+      TCP_USER="tcp_$(openssl rand -hex 4)"; TCP_PASS="$(randpw)"
+      [ -n "$TCP_PASS" ] || { rm -rf "$temp"; return 1; }
     fi
-    TCP_PORT=$((10#$TCP_PORT)); UDP_PORT=$((10#$UDP_PORT))
+    if [[ "$mode" = 2 || "$mode" = 3 ]] && [ -z "$UDP_PORT" ]; then
+      UDP_PORT="$(mieru_random_range UDP)" || { rm -rf "$temp"; return 1; }
+      read -r -p "UDP 端口或范围 [$UDP_PORT]: " in_udp || { rm -rf "$temp"; return 1; }
+      UDP_PORT="$(mieru_normalize_port "${in_udp:-$UDP_PORT}")" || { rm -rf "$temp"; return 1; }
+      mieru_check_port "$UDP_PORT" "" UDP || { rm -rf "$temp"; return 1; }
+      UDP_USER="udp_$(openssl rand -hex 4)"; UDP_PASS="$(randpw)"
+      [ -n "$UDP_PASS" ] || { rm -rf "$temp"; return 1; }
+    fi
+  elif [ "$kind" = port ]; then
+    if [ -n "$TCP_PORT" ]; then
+      read -r -p "TCP 端口或范围 [$TCP_PORT，回车不变]: " in_tcp || { rm -rf "$temp"; return 1; }
+      TCP_PORT="$(mieru_normalize_port "${in_tcp:-$TCP_PORT}")" || { rm -rf "$temp"; return 1; }
+      mieru_check_port "$TCP_PORT" "$old_tcp" TCP || { rm -rf "$temp"; return 1; }
+    fi
+    if [ -n "$UDP_PORT" ]; then
+      read -r -p "UDP 端口或范围 [$UDP_PORT，回车不变]: " in_udp || { rm -rf "$temp"; return 1; }
+      UDP_PORT="$(mieru_normalize_port "${in_udp:-$UDP_PORT}")" || { rm -rf "$temp"; return 1; }
+      mieru_check_port "$UDP_PORT" "$old_udp" UDP || { rm -rf "$temp"; return 1; }
+    fi
   else
-    read -r -p "TCP 用户名 [$TCP_USER，回车不变]: " in_tcp || { rm -rf "$temp"; return 1; }
-    TCP_USER="${in_tcp:-$TCP_USER}"
-    read -r -p "TCP 密码 [回车不变]: " in_tcp || { rm -rf "$temp"; return 1; }
-    TCP_PASS="${in_tcp:-$TCP_PASS}"
-    read -r -p "UDP 用户名 [$UDP_USER，回车不变]: " in_udp || { rm -rf "$temp"; return 1; }
-    UDP_USER="${in_udp:-$UDP_USER}"
-    read -r -p "UDP 密码 [回车不变]: " in_udp || { rm -rf "$temp"; return 1; }
-    UDP_PASS="${in_udp:-$UDP_PASS}"
-    if [ "$TCP_USER" = "$UDP_USER" ]; then
+    if [ -n "$TCP_PORT" ]; then
+      read -r -p "TCP 用户名 [$TCP_USER，回车不变]: " in_tcp || { rm -rf "$temp"; return 1; }
+      TCP_USER="${in_tcp:-$TCP_USER}"
+      read -r -p "TCP 密码 [回车不变]: " in_tcp || { rm -rf "$temp"; return 1; }
+      TCP_PASS="${in_tcp:-$TCP_PASS}"
+    fi
+    if [ -n "$UDP_PORT" ]; then
+      read -r -p "UDP 用户名 [$UDP_USER，回车不变]: " in_udp || { rm -rf "$temp"; return 1; }
+      UDP_USER="${in_udp:-$UDP_USER}"
+      read -r -p "UDP 密码 [回车不变]: " in_udp || { rm -rf "$temp"; return 1; }
+      UDP_PASS="${in_udp:-$UDP_PASS}"
+    fi
+    if [ -n "$TCP_USER" ] && [ "$TCP_USER" = "$UDP_USER" ]; then
       echo "TCP 和 UDP 用户名不能相同"; rm -rf "$temp"; return 1
     fi
   fi
@@ -968,8 +1111,13 @@ change_mieru() {
   read -r -p "确认应用并短暂中断连接? [y/N]: " answer || { rm -rf "$temp"; return 1; }
   if [[ ! "$answer" = [yY] ]]; then echo "已取消"; rm -rf "$temp"; return 0; fi
 
-  for file in server.json clash-mate.yaml tcp.txt udp.txt tcp.png udp.png; do
+  for file in server.json clash-mate.yaml; do
     cp -p "$MIERU_BASE/$file" "$backup/$file" || { echo "备份失败"; rm -rf "$temp"; return 1; }
+  done
+  for file in tcp.txt tcp.png udp.txt udp.png; do
+    if [ -f "$MIERU_BASE/$file" ]; then
+      cp -p "$MIERU_BASE/$file" "$backup/$file" || { echo "备份失败"; rm -rf "$temp"; return 1; }
+    fi
   done
   if ! python3 - "$backup/server.json" "$stage/server.json" "$old_tcp_user" "$old_udp_user" "$TCP_PORT" "$UDP_PORT" "$TCP_USER" "$TCP_PASS" "$UDP_USER" "$UDP_PASS" <<'PY'
 import json, sys
@@ -979,16 +1127,29 @@ with open(src, encoding='utf-8') as f:
 # The old ports are taken from the saved client nodes rather than inferred by protocol.
 with open(src.replace('server.json', 'clash-mate.yaml'), encoding='utf-8') as f:
     nodes = [json.loads(line.strip()[2:]) for line in f if line.strip().startswith('- ')]
-for protocol, new_port in (('TCP', tcp_port), ('UDP', udp_port)):
-    old_port, = [n['port'] for n in nodes if n.get('type') == 'mieru' and n.get('transport') == protocol]
-    for binding in config['portBindings']:
-        if binding.get('protocol') == protocol and binding.get('port') == old_port:
-            binding['port'] = int(new_port)
-for user in config['users']:
-    if user.get('name') == old_tcp:
-        user['name'], user['password'] = tcp_user, tcp_pass
-    elif user.get('name') == old_udp:
-        user['name'], user['password'] = udp_user, udp_pass
+for protocol, new_port, old_user, new_user, new_pass in (
+        ('TCP', tcp_port, old_tcp, tcp_user, tcp_pass), ('UDP', udp_port, old_udp, udp_user, udp_pass)):
+    matches = [n for n in nodes if n.get('type') == 'mieru' and n.get('transport') == protocol]
+    if matches:
+        node, = matches
+        old_key = 'portRange' if 'port-range' in node else 'port'
+        old_port = node.get('port-range', node.get('port'))
+        binding, = [b for b in config['portBindings'] if b.get('protocol') == protocol and b.get(old_key) == old_port]
+        user, = [u for u in config['users'] if u.get('name') == old_user]
+        if not new_port:
+            config['portBindings'].remove(binding)
+            config['users'].remove(user)
+            continue
+        binding.pop('port', None)
+        binding.pop('portRange', None)
+        user['name'], user['password'] = new_user, new_pass
+    elif new_port:
+        binding = {'protocol': protocol}
+        config['portBindings'].append(binding)
+        config['users'].append({'name': new_user, 'password': new_pass})
+    else:
+        continue
+    binding['portRange' if '-' in new_port else 'port'] = new_port if '-' in new_port else int(new_port)
 names = [user.get('name') for user in config['users']]
 if len(names) != len(set(names)):
     raise ValueError('用户名与已有用户重复')
@@ -1008,11 +1169,17 @@ PY
   if { [ "$was_running" = 0 ] || mita stop; } && mita replace config "$stage/server.json" &&
      { [ "$was_running" = 0 ] || { mita start && mita status | grep -q RUNNING; }; }; then
     for file in server.json clash-mate.yaml tcp.txt udp.txt tcp.png udp.png; do
-      if ! cp -p "$stage/$file" "$MIERU_BASE/$file"; then
+      if [ ! -f "$stage/$file" ]; then
+        if rm -f "$MIERU_BASE/$file"; then continue; fi
+      elif cp -p "$stage/$file" "$MIERU_BASE/$file"; then
+        continue
+      fi
+      {
+
         echo "保存新配置失败，正在回滚。"
         mieru_rollback "$backup" "$was_running" && rm -rf "$temp"
         return 1
-      fi
+      }
     done
   else
     echo "应用新配置失败，正在回滚。"
@@ -1021,8 +1188,67 @@ PY
   fi
   rm -rf "$temp"
   show_mieru
-  [ "$kind" != port ] || echo "请在防火墙和云安全组放行 TCP $TCP_PORT、UDP $UDP_PORT。"
-  echo "两个账户均可用于这两个监听端口；旧客户端需更新配置。"
+  if [ "$kind" = port ] || [ "$kind" = mode ]; then
+    [ -z "$TCP_PORT" ] || echo "请放行 TCP $TCP_PORT。"
+    [ -z "$UDP_PORT" ] || echo "请放行 UDP $UDP_PORT。"
+    echo "请在防火墙和云安全组放行整个范围。"
+  fi
+  echo "旧客户端需更新配置；Mieru 在新建连接时选择端口。"
+}
+
+change_mieru_address() {
+  local IP TCP_PORT UDP_PORT TCP_USER TCP_PASS UDP_USER UDP_PASS
+  local temp stage backup choice address old_ip file restore_ok
+  local -a data files
+  [ -f "$MIERU_BASE/server.json" ] && [ -f "$MIERU_BASE/clash-mate.yaml" ] || { echo "还没有安装 mieru"; return 1; }
+  umask 077
+  temp="$(mktemp -d "$MIERU_BASE/.address.XXXXXXXX")" || return 1
+  stage="$temp/stage"; backup="$temp/backup"
+  mkdir "$stage" "$backup" || { rm -rf "$temp"; return 1; }
+  if ! mieru_load_edit_data "$temp/data"; then rm -rf "$temp"; return 1; fi
+  mapfile -d '' -t data < "$temp/data"
+  if [ "${#data[@]}" -ne 7 ]; then echo "配置数据不完整"; rm -rf "$temp"; return 1; fi
+  old_ip="${data[0]}"; TCP_PORT="${data[1]}"; UDP_PORT="${data[2]}"
+  TCP_USER="${data[3]}"; TCP_PASS="${data[4]}"; UDP_USER="${data[5]}"; UDP_PASS="${data[6]}"
+  echo "当前节点地址: $old_ip"
+  echo "1 自动检测公网 IPv6  2 自动检测公网 IPv4  3 手动输入地址或域名"
+  read -r -p "选择 [回车取消]: " choice || { rm -rf "$temp"; return 1; }
+  case "$choice" in
+    1) address="$(mieru_detect_address 6)" || { rm -rf "$temp"; return 1; } ;;
+    2) address="$(mieru_detect_address 4)" || { rm -rf "$temp"; return 1; } ;;
+    3) read -r -p "服务器 IPv4 / IPv6 地址或域名: " address || { rm -rf "$temp"; return 1; } ;;
+    *) echo "已取消"; rm -rf "$temp"; return 0 ;;
+  esac
+  IP="$(mieru_normalize_address "$address")" || { rm -rf "$temp"; return 1; }
+  if [ "$IP" = "$old_ip" ]; then echo "地址没有变化"; rm -rf "$temp"; return 0; fi
+  echo "新节点地址: $IP"
+  read -r -p "确认更新客户端配置、链接和二维码? [y/N]: " choice || { rm -rf "$temp"; return 1; }
+  if [[ ! "$choice" = [yY] ]]; then echo "已取消"; rm -rf "$temp"; return 0; fi
+  files=(clash-mate.yaml)
+  [ -z "$TCP_PORT" ] || files+=(tcp.txt tcp.png)
+  [ -z "$UDP_PORT" ] || files+=(udp.txt udp.png)
+  for file in "${files[@]}"; do
+    cp -p "$MIERU_BASE/$file" "$backup/$file" || { echo "备份客户端配置失败"; rm -rf "$temp"; return 1; }
+  done
+  if ! ( MIERU_BASE="$stage"; mieru_write_clients ); then
+    echo "生成客户端配置或二维码失败"; rm -rf "$temp"; return 1
+  fi
+  for file in "${files[@]}"; do
+    if ! cp -p "$stage/$file" "$MIERU_BASE/$file"; then
+      echo "保存失败，正在恢复旧客户端配置。"
+      restore_ok=1
+      for file in "${files[@]}"; do cp -p "$backup/$file" "$MIERU_BASE/$file" || restore_ok=0; done
+      if [ "$restore_ok" = 1 ]; then
+        rm -rf "$temp"
+      else
+        echo "恢复未完全成功，备份保留在 $backup。"
+      fi
+      return 1
+    fi
+  done
+  rm -rf "$temp"
+  show_mieru
+  echo "仅更新了节点地址，服务端监听配置未改变。IPv6 需确认公网可达、服务监听及防火墙规则。"
 }
 
 mieru_menu() {
@@ -1030,9 +1256,10 @@ mieru_menu() {
   while :; do
     echo
     echo "========== Mieru =========="
-    echo "1 安装 TCP + UDP  2 卸载  3 查看配置和二维码  4 返回"
+    echo "1 安装 Mieru  2 卸载  3 查看配置和二维码  4 返回"
     echo "5 更新 mita  6 启动 / 关闭 / 重启  7 状态和日志"
-    echo "8 修改 TCP / UDP 端口  9 修改账号 / 密码"
+    echo "8 修改 TCP / UDP 端口或范围  9 修改账号 / 密码  10 切换传输方式"
+    echo "11 切换节点地址 IPv4 / IPv6 / 域名"
     read -r -p "选择: " choice || return
     case "$choice" in
       1) ( install_mieru ) ;;
@@ -1052,6 +1279,8 @@ mieru_menu() {
       7) ( systemctl --no-pager --full status mita.service || true; mita status || true; journalctl -u mita.service -n 40 --no-pager || true ) ;;
       8) ( change_mieru port ) ;;
       9) ( change_mieru account ) ;;
+      10) ( change_mieru mode ) ;;
+      11) ( change_mieru_address ) ;;
       *) echo "无效选项" ;;
     esac
     read -r -p "按回车返回菜单..." _ || return
