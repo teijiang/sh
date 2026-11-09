@@ -7,7 +7,7 @@
 #ver cker.sh 0.1
 #ver fix-debian12-13_cve-2026-99999.sh 0.1.1
 #ver hy2tj.sh 0.1
-#ver benchx.sh 0.3
+#ver benchx.sh 0.4
 #ver clear.sh 0.1
 #ver fio.sh 0.1
 #ver tj.sh 0.1
