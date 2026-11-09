@@ -1,5 +1,5 @@
 #!/bin/bash
-# VPS 性能快速检测脚本 v0.3
+# VPS 性能快速检测脚本 v0.4
 # by tj 机组(teijiang,远古巨瘦,钻舰队长,鸡贼王，石巨人,牛头人)带领claude、dp3出品
 # CPU 项改为 cpubench（Go）。综合指数是五项 ops/s 的几何平均，不是 GB5；拿到对照机器后再校准。
 
@@ -260,7 +260,7 @@ test_disk_performance() {
 test_cpu_performance() {
     echo -e "\n\033[1;34m━━ CPU 测试 ━━\033[0m"
 
-    local cpu_model cpu_mhz physical eff cv go_ver name single multi scale json gb5_factor
+    local cpu_model cpu_mhz physical eff cv go_ver name single multi scale json bench_cpus change_pct
     cpu_model=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
     [[ -z "$cpu_model" ]] && cpu_model="未知"
     cores=$(nproc 2>/dev/null || echo 1)
@@ -304,14 +304,29 @@ test_cpu_performance() {
         return
     fi
 
+    bench_cpus=$(jq -r '.cpus' <<<"$json")
+    if ! [[ "$bench_cpus" =~ ^[1-9][0-9]*$ ]]; then
+        echo "结果缺少有效的 CPU 数量，无法判断测试模式"
+        return
+    fi
+
     echo
-    echo "  基准明细（Single: 单核，Multi: 多核，Scale: 扩展比；单位 ops/s）"
-    printf '  %-16s %12s %12s %8s\n' "Workload" "Single" "Multi" "Scale"
+    if (( bench_cpus == 1 )); then
+        echo "  基准明细（两组均为单线程，每组取中位数；单位 ops/s）"
+        printf '  %-16s %12s %12s\n' "Workload" "Group 1" "Group 2"
+    else
+        echo "  基准明细（Single: 单核，Multi: 多核，Scale: 扩展比；单位 ops/s）"
+        printf '  %-16s %12s %12s %8s\n' "Workload" "Single" "Multi" "Scale"
+    fi
     for name in hash_lookup string_render pointer_chase json_roundtrip branchy_parse; do
         single=$(jq -r --arg n "$name" '.results[$n].single' <<<"$json")
         multi=$(jq -r --arg n "$name" '.results[$n].multi' <<<"$json")
         scale=$(jq -r --arg n "$name" '.results[$n].scale' <<<"$json")
-        printf '  %-16s %12.0f %12.0f %7.2fx\n' "$name" "$single" "$multi" "$scale"
+        if (( bench_cpus == 1 )); then
+            printf '  %-16s %12.0f %12.0f\n' "$name" "$single" "$multi"
+        else
+            printf '  %-16s %12.0f %12.0f %7.2fx\n' "$name" "$single" "$multi" "$scale"
+        fi
     done
 
     CPU_SINGLE_SCORE=$(jq -r '.single_geomean | floor' <<<"$json")
@@ -331,8 +346,14 @@ test_cpu_performance() {
     echo
     echo "  综合结果"
     echo "    单核指数 : $(format_number "$CPU_SINGLE_SCORE") ops/s（五项几何平均，非 GB5）"
-    echo "    多核指数 : $(format_number "$CPU_MULTI_SCORE") ops/s（五项几何平均，非 GB5）"
-    echo "    扩展比   : ${CPU_SCALE}x / ${cores} 线程（并行效率 ${eff}%）"
+    if (( bench_cpus == 1 )); then
+        change_pct=$(awk -v first="$CPU_SINGLE_SCORE" -v second="$CPU_MULTI_SCORE" 'BEGIN { if (first > 0) printf "%+.2f", (second / first - 1) * 100; else print "无法计算" }')
+        echo "    稳定性   : 第 1 组 $(format_number "$CPU_SINGLE_SCORE") / 第 2 组 $(format_number "$CPU_MULTI_SCORE") ops/s"
+        echo "               第 2 组相对第 1 组变化 ${change_pct}%（每组各项均取中位数）"
+    else
+        echo "    多核指数 : $(format_number "$CPU_MULTI_SCORE") ops/s（五项几何平均，非 GB5）"
+        echo "    扩展比   : ${CPU_SCALE}x / ${cores} 线程（并行效率 ${eff}%）"
+    fi
     echo "    CPU steal: ${STEAL_PCT}%（偏高可能表示宿主机争用）"
     if [[ "$CPU_BENCH_REPS" -gt 1 ]]; then
         echo "    单核 CV  : ${cv}%（越高表示重复测试波动越大）"
@@ -340,7 +361,9 @@ test_cpu_performance() {
     echo
     echo "  GB5 估算（仅供参考，非实测）"
     echo "    单核: $(format_number "$CPU_GB5_SINGLE_EST")"
-    echo "    多核: $(format_number "$CPU_GB5_MULTI_EST")（单核估值 × ${CPU_SCALE} × 1.1）"
+    if (( bench_cpus > 1 )); then
+        echo "    多核: $(format_number "$CPU_GB5_MULTI_EST")（单核估值 × ${CPU_SCALE} × 1.1）"
+    fi
 }
 
 # ==================== 3. 内存带宽测试 ====================
