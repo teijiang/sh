@@ -5,12 +5,13 @@
 
 # 各脚本版本。发布更新时改对应行。现在从最小版本 0.1 起。
 #ver cker.sh 0.1
-#ver fix-debian12-13_cve-2026-99999.sh 0.1.1
-#ver hy2tj.sh 0.1
-#ver benchx.sh 0.4
+#ver fix-debian12-13_cve-2026-99999.sh 0.1
+#ver hy2tj.sh 0.2
+#ver benchx.sh 0.1
 #ver clear.sh 0.1
 #ver fio.sh 0.1
-#ver tj.sh 0.1
+#ver cpu_stress_test.py 0.1
+#ver tj.sh 0.2
 MIN_VER=0.1
 
 if [ -z "${BASH_VERSION:-}" ]; then
@@ -27,6 +28,7 @@ files=(
   benchx.sh
   clear.sh
   fio.sh
+  cpu_stress_test.py
 )
 labels=(
   "更换 Debian 12/13 内核"
@@ -35,6 +37,7 @@ labels=(
   "快速测试 GB5 评分"
   "快速清理系统"
   "硬盘经典测试"
+  "CPU 高负载压力测试"
 )
 
 [ "${#files[@]}" -eq "${#labels[@]}" ] || { echo "菜单配置不一致" >&2; exit 1; }
@@ -94,7 +97,7 @@ ver_gt() {
 valid_script_name() {
   case "$1" in
     ""|.*|*"/"*|*" "*|*$'\n'*|*$'\r'*) return 1 ;;
-    *.sh) return 0 ;;
+    *.sh|*.py) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -119,6 +122,8 @@ self_check() {
   valid_script_name "" && { echo "self-check: 空文件名" >&2; exit 1; }
   valid_script_name ".partial" && { echo "self-check: .partial" >&2; exit 1; }
   valid_script_name "cker.sh" || { echo "self-check: cker.sh" >&2; exit 1; }
+  valid_script_name "cpu_stress_test.py" || { echo "self-check: cpu_stress_test.py" >&2; exit 1; }
+  valid_script_name "../cpu_stress_test.py" && { echo "self-check: 非法路径" >&2; exit 1; }
   valid_script_name "fix-debian12-13_cve-2026-99999.sh" || { echo "self-check: 长文件名" >&2; exit 1; }
   ver_gt 0.2 0.1 || { echo "self-check: 0.2 > 0.1" >&2; exit 1; }
   ver_gt 0.10 0.9 || { echo "self-check: 0.10 > 0.9" >&2; exit 1; }
@@ -140,6 +145,10 @@ run_one() {
   local name="$1"
   # local 同一行会先展开，$name 这时还是空的，path 会变成目录本身。
   local path="${here%/}/$name"
+  if [[ "$name" == *.py ]] && ! command -v python3 >/dev/null 2>&1; then
+    echo "缺少 python3，无法运行 $name" >&2
+    return 1
+  fi
   if [ ! -f "$path" ]; then
     command -v curl >/dev/null 2>&1 || { echo "缺少 curl，且本地没有 $name" >&2; return 1; }
     [ -w "$here" ] || { echo "目录不可写，无法下载: $here" >&2; return 1; }
@@ -148,7 +157,10 @@ run_one() {
   fi
   echo
   echo ">>> $name"
-  bash "$path"
+  case "$name" in
+    *.py) python3 "$path" ;;
+    *) bash "$path" ;;
+  esac
 }
 
 check_updates() {
