@@ -438,10 +438,27 @@ hy2_validate_hop_range() {
 }
 
 hy2_check_hop_ports() {
-  local start="$1" end="$2" sockets conflict
-  sockets="$(ss -lun)" || { echo "无法检查已占用 UDP 端口"; return 1; }
-  conflict="$(printf '%s\n' "$sockets" | awk -v a="$start" -v b="$end" 'NR>1 {n=split($4,p,":"); v=p[n]; if (v ~ /^[0-9]+$/ && v>=a && v<=b) {print v; exit}}')"
-  [ -z "$conflict" ] || { echo "UDP 端口 $conflict 已被占用"; return 1; }
+  local start="$1" end="$2" allow_self="${3:-0}" main_pid=0 sockets conflict
+  if [ "$allow_self" = 1 ]; then
+    main_pid="$(systemctl show -p MainPID --value hysteria.service 2>/dev/null || true)"
+    [[ "$main_pid" =~ ^[0-9]+$ ]] || main_pid=0
+  fi
+  sockets="$(ss -lunp)" || { echo "无法检查已占用 UDP 端口"; return 1; }
+  # 只忽略完全属于当前 hysteria.service 主进程的套接字；未知或共享的占用仍视为冲突。
+  conflict="$(printf '%s\n' "$sockets" | awk -v a="$start" -v b="$end" -v self="$main_pid" '
+    NR>1 {
+      n=split($4,p,":"); v=p[n]
+      if (v !~ /^[0-9]+$/ || v<a || v>b) next
+      line=$0; owners=0; ours=1
+      while (match(line, /pid=[0-9]+/)) {
+        pid=substr(line,RSTART+4,RLENGTH-4)
+        if (self == 0 || pid != self) ours=0
+        owners++
+        line=substr(line,RSTART+RLENGTH)
+      }
+      if (owners == 0 || !ours) {print v; exit}
+    }')"
+  [ -z "$conflict" ] || { echo "UDP 端口 $conflict 被其他进程占用或无法确认归属"; return 1; }
 }
 
 get_latest_ver() {
@@ -590,6 +607,7 @@ change_hop() {
       hy2_validate_hop_range "$HOP_START" "$HOP_END" || return 1
       HOP_START=$((10#$HOP_START)); HOP_END=$((10#$HOP_END))
       hy2_require_native_hop || return 1
+      hy2_check_hop_ports "$HOP_START" "$HOP_END" 1 || return 1
       HOP=1; HOP_MODE=native; HOP_IFACE=""; PORT="$HOP_START"
       echo "新主端口为 $PORT，服务端将使用 listen: :${HOP_START}-${HOP_END}。"
       ;;
@@ -609,26 +627,6 @@ change_hop() {
     echo "生成配置失败，原配置未改变。"; rm -rf "$temp"; return 1
   fi
   systemctl is-active --quiet hysteria.service && running=1
-  # 新配置先生成到暂存目录，再停止当前服务检查端口，避免把 HY2 自己的旧监听当成冲突。
-  if [ "$running" = 1 ]; then
-    if ! systemctl stop hysteria.service; then
-      echo "无法停止现有 HY2 服务，原配置未改变。"; rm -rf "$temp"; return 1
-    fi
-    if systemctl is-active --quiet hysteria.service; then
-      echo "HY2 服务仍在运行，原配置未改变。"; rm -rf "$temp"; return 1
-    fi
-  fi
-  if [ "$HOP" = 1 ] && ! hy2_check_hop_ports "$HOP_START" "$HOP_END"; then
-    if [ "$running" = 1 ]; then
-      if systemctl start hysteria.service && systemctl is-active --quiet hysteria.service; then
-        echo "已恢复原 HY2 服务，原配置未改变。"
-      else
-        echo "原配置未改变，但服务恢复失败，请检查菜单 7 的日志。"
-      fi
-    fi
-    rm -rf "$temp"
-    return 1
-  fi
   ok=1
   if [ "$old_hop" = 1 ] && [ "$old_mode" = legacy ]; then
     legacy_touched=1
@@ -640,7 +638,7 @@ change_hop() {
     done
   fi
   if [ "$ok" = 1 ] && [ "$running" = 1 ]; then
-    if systemctl start hysteria.service; then
+    if systemctl restart hysteria.service; then
       sleep 1
       systemctl is-active --quiet hysteria.service || ok=0
     else
@@ -658,7 +656,7 @@ change_hop() {
       ( HOP=1; HOP_MODE=legacy; HOP_IFACE="$old_iface"; HOP_START="$old_start"; HOP_END="$old_end"; PORT="$old_port"; apply_hop ) || ok=0
     fi
     if [ "$running" = 1 ]; then
-      systemctl start hysteria.service && systemctl is-active --quiet hysteria.service || ok=0
+      systemctl restart hysteria.service && systemctl is-active --quiet hysteria.service || ok=0
     fi
     if [ "$ok" = 1 ]; then rm -rf "$temp"; echo "已恢复旧配置。"; else echo "恢复未完全成功，备份保留在 $backup。"; fi
     return 1
