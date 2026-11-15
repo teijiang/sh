@@ -456,9 +456,21 @@ hy2_check_hop_ports() {
         owners++
         line=substr(line,RSTART+RLENGTH)
       }
-      if (owners == 0 || !ours) {print v; exit}
+      if (owners == 0 || !ours) {print; exit}
     }')"
-  [ -z "$conflict" ] || { echo "UDP 端口 $conflict 被其他进程占用或无法确认归属"; return 1; }
+  if [ -n "$conflict" ]; then
+    echo "UDP 端口范围存在占用，进程和 PID 如下（来自 ss）："
+    printf '%s\n' "$conflict"
+    if [ "$allow_self" = 1 ]; then
+      if [ "$main_pid" != 0 ]; then
+        echo "当前 hysteria.service 主进程 PID: $main_pid"
+      else
+        echo "无法获取 hysteria.service 的主进程 PID。"
+      fi
+    fi
+    echo "如未显示进程信息，请检查系统权限或使用 ss -lunp 查看。"
+    return 1
+  fi
 }
 
 get_latest_ver() {
