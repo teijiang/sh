@@ -73,12 +73,24 @@ detect_ip() {
 
 load_meta() {
   [ -f "$META" ] || { echo "还没有安装"; exit 1; }
+  # 缺少 HOP_MODE 的旧安装仍使用原先的 DNAT，避免静默中断现有连接。
+  unset HOP_MODE
   # shellcheck disable=SC1090
   . "$META"
+  case "${HOP_MODE:-}" in
+    native|legacy) ;;
+    '') [ "${HOP:-0}" = 1 ] && HOP_MODE=legacy || HOP_MODE=native ;;
+    *) echo "未知端口跳跃模式: $HOP_MODE"; return 1 ;;
+  esac
   # 兼容旧版本：以前只要有 OBFS 密码就表示开启 Gecko 混淆。
   case "${OBFS_ENABLED:-}" in
     0|1) ;;
     *) [ -n "${OBFS:-}" ] && OBFS_ENABLED=1 || OBFS_ENABLED=0 ;;
+  esac
+  OBFS_TYPE="${OBFS_TYPE:-gecko}"
+  case "$OBFS_TYPE" in
+    gecko|salamander) ;;
+    *) echo "未知混淆类型: $OBFS_TYPE"; return 1 ;;
   esac
 }
 
@@ -86,7 +98,7 @@ save_meta() {
   mkdir -p "$BASE"
   local key
   : > "$META"
-  for key in PORT AUTH OBFS_ENABLED OBFS UP DOWN IP SNI CERT_MODE DOMAIN EMAIL HOP HOP_START HOP_END HOP_IFACE; do
+  for key in PORT AUTH OBFS_ENABLED OBFS_TYPE OBFS UP DOWN IP SNI CERT_MODE DOMAIN EMAIL HOP HOP_MODE HOP_START HOP_END HOP_IFACE; do
     printf '%s=%q\n' "$key" "${!key-}" >> "$META"
   done
   chmod 600 "$META"
@@ -124,7 +136,7 @@ EOF
 }
 
 write_config() {
-  local tls_block obfs_block quoted_auth quoted_obfs
+  local tls_block obfs_block quoted_auth quoted_obfs listen_port
   quoted_auth="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$AUTH")" || return 1
   quoted_obfs="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${OBFS:-}")" || return 1
   if [ "$CERT_MODE" = "acme" ]; then
@@ -138,15 +150,21 @@ write_config() {
   key: /etc/hysteria/private.key"
   fi
   if [ "${OBFS_ENABLED:-0}" = "1" ]; then
+    case "${OBFS_TYPE:-gecko}" in gecko|salamander) ;; *) echo "未知混淆类型"; return 1 ;; esac
     obfs_block="obfs:
-  type: gecko
-  gecko:
+  type: ${OBFS_TYPE:-gecko}
+  ${OBFS_TYPE:-gecko}:
     password: ${quoted_obfs}"
   else
     obfs_block=""
   fi
+  listen_port="$PORT"
+  if [ "${HOP:-0}" = 1 ] && [ "${HOP_MODE:-legacy}" = native ]; then
+    [[ "${HOP_START:-}" =~ ^[0-9]+$ && "${HOP_END:-}" =~ ^[0-9]+$ ]] || { echo "跳跃端口范围无效"; return 1; }
+    listen_port="${HOP_START}-${HOP_END}"
+  fi
   cat > "$CFG" <<EOF
-listen: :${PORT}
+listen: :${listen_port}
 
 ${tls_block}
 
@@ -172,30 +190,35 @@ write_clients() {
   node_name="HY2"
   if [ "${OBFS_ENABLED:-0}" = "1" ]; then
     enc_obfs="$(urlencode "$OBFS")" || return 1
-    query="obfs=gecko&obfs-password=${enc_obfs}&${query}"
-    node_name="HY2-Gecko"
+    case "${OBFS_TYPE:-gecko}" in gecko|salamander) ;; *) echo "未知混淆类型"; return 1 ;; esac
+    query="obfs=${OBFS_TYPE:-gecko}&obfs-password=${enc_obfs}&${query}"
+    if [ "${OBFS_TYPE:-gecko}" = salamander ]; then node_name="HY2-Salamander"; else node_name="HY2-Gecko"; fi
   fi
   [ "$CERT_MODE" = "self" ] && extra="&insecure=1"
   if [ "${HOP:-0}" = "1" ]; then
-    extra="${extra}&mport=${PORT},${HOP_START}-${HOP_END}"
+    if [ "${HOP_MODE:-legacy}" = native ]; then
+      extra="${extra}&mport=${HOP_START}-${HOP_END}"
+    else
+      extra="${extra}&mport=${PORT},${HOP_START}-${HOP_END}"
+    fi
   fi
   link="hysteria2://${enc_auth}@${IP}:${PORT}/?${query}${extra}#${node_name}"
   echo "$link" > "$BASE/neko.txt"
   qrencode -o "$BASE/hy2.png" "$link" || return 1
   bare="${IP//[\[\]]/}"
   # JSON flow mappings are also valid YAML; quoting protects custom passwords and IPv6.
-  python3 - "$bare" "$PORT" "$AUTH" "$SNI" "$CERT_MODE" "${OBFS_ENABLED:-0}" "${OBFS:-}" "${HOP:-0}" "${HOP_START:-}" "${HOP_END:-}" > "$BASE/clash-mate.yaml" <<'PY'
+  python3 - "$bare" "$PORT" "$AUTH" "$SNI" "$CERT_MODE" "${OBFS_ENABLED:-0}" "${OBFS_TYPE:-gecko}" "${OBFS:-}" "${HOP:-0}" "${HOP_MODE:-legacy}" "${HOP_START:-}" "${HOP_END:-}" > "$BASE/clash-mate.yaml" <<'PY'
 import json, sys
-ip, port, password, sni, cert, obfs_on, obfs, hop, start, end = sys.argv[1:]
+ip, port, password, sni, cert, obfs_on, obfs_type, obfs, hop, hop_mode, start, end = sys.argv[1:]
 node = {'name': 'h-delux', 'type': 'hysteria2', 'server': ip, 'port': int(port),
         'password': password, 'alpn': ['h3'], 'sni': sni,
         'skip-cert-verify': cert == 'self'}
 if obfs_on == '1':
-    node.update({'obfs': 'gecko', 'obfs-password': obfs})
+    node.update({'obfs': obfs_type, 'obfs-password': obfs})
 node['fast-open'] = True
 if hop == '1':
     # mihomo uses ports; mport is included for clients using that spelling.
-    node['ports'] = node['mport'] = f'{port},{start}-{end}'
+    node['ports'] = node['mport'] = f'{start}-{end}' if hop_mode == 'native' else f'{port},{start}-{end}'
 print('proxies:\n  - ' + json.dumps(node, ensure_ascii=False))
 PY
   [ $? -eq 0 ] || return 1
@@ -203,23 +226,27 @@ PY
 }
 
 restart_svc() {
-  write_unit
-  systemctl enable hysteria.service
+  write_unit || return 1
+  systemctl enable hysteria.service || return 1
   systemctl restart hysteria.service
 }
 
 show_info() {
-  load_meta
+  load_meta || return 1
   write_clients || return 1
   echo "地址: $IP"
   echo "端口: $PORT"
   echo "认证密码: $AUTH"
   if [ "${OBFS_ENABLED:-0}" = "1" ]; then
-    echo "Gecko 混淆: 开启，密码: $OBFS"
+    echo "混淆: $OBFS_TYPE，密码: $OBFS"
   else
-    echo "Gecko 混淆: 关闭"
+    echo "混淆: 关闭"
   fi
   echo "证书: $CERT_MODE  SNI: $SNI"
+  if [ "${HOP:-0}" = 1 ]; then
+    echo "端口跳跃: ${HOP_START}-${HOP_END}（${HOP_MODE}）"
+    [ "$HOP_MODE" != legacy ] || echo "旧版 DNAT 跳跃仍在使用；菜单 10 可迁移到内核范围监听。"
+  fi
   echo
   echo "节点链接:"
   cat "$BASE/neko.txt"
@@ -243,6 +270,8 @@ make_self_cert() {
 
 apply_hop() {
   local iface
+  # 仅维护旧版配置；新范围监听由 Hysteria 自行管理转发规则。
+  [ "${HOP_MODE:-legacy}" != native ] || return 0
   if [ "${HOP:-0}" != "1" ]; then
     systemctl disable --now ipppp.service 2>/dev/null || true
     rm -f /etc/systemd/system/ipppp.service "$BASE/ipppp.sh"
@@ -277,11 +306,11 @@ install_hysteria() {
     echo "已经安装。要重装请先选 2。"
     exit 1
   fi
-  need_pkgs
+  need_pkgs || return 1
   detect_ip
   download_bin
 
-  local in_port in_auth in_obfs in_obfs_enabled in_up in_down in_sni in_ip in_cert in_hop
+  local in_port in_auth in_obfs in_obfs_type in_up in_down in_sni in_ip in_cert in_hop
 
     while :; do
     rand_port=$((RANDOM % 55536 + 10000))
@@ -296,23 +325,19 @@ install_hysteria() {
   read -r -p "认证密码 [回车随机]: " in_auth
   AUTH="${in_auth:-$(randpw)}"
 
-  read -r -p "开启 Gecko 混淆? 1=开启 0=关闭 [1]: " in_obfs_enabled
-  in_obfs_enabled="${in_obfs_enabled:-1}"
-  case "$in_obfs_enabled" in
-    1)
-      OBFS_ENABLED=1
-      read -r -p "Gecko 混淆密码 [回车随机]: " in_obfs
-      OBFS="${in_obfs:-$(randpw)}"
-      ;;
-    0)
-      OBFS_ENABLED=0
-      OBFS=""
-      ;;
-    *)
-      echo "请选择 1 或 0"
-      exit 1
-      ;;
+  read -r -p "混淆方式 1=Gecko 2=Salamander 3=关闭 [1]: " in_obfs_type || return 1
+  case "${in_obfs_type:-1}" in
+    1) OBFS_ENABLED=1; OBFS_TYPE=gecko ;;
+    2) OBFS_ENABLED=1; OBFS_TYPE=salamander ;;
+    3|0) OBFS_ENABLED=0; OBFS_TYPE=gecko ;;
+    *) echo "请选择 1、2 或 3"; return 1 ;;
   esac
+  OBFS=""
+  if [ "$OBFS_ENABLED" = 1 ]; then
+    read -r -p "$OBFS_TYPE 混淆密码 [回车随机]: " in_obfs || return 1
+    OBFS="${in_obfs:-$(randpw)}"
+    [ -n "$OBFS" ] || { echo "随机密码生成失败"; return 1; }
+  fi
 
   read -r -p "上行 Mbps [100]: " in_up
   UP="${in_up:-100}"
@@ -345,28 +370,34 @@ install_hysteria() {
   fi
 
   HOP=0
+  HOP_MODE=native
   HOP_START=""
   HOP_END=""
   HOP_IFACE=""
-  read -r -p "开启端口跳跃? 1=开启 [回车不开启]: " in_hop
+  read -r -p "开启端口跳跃? 1=开启 [回车不开启]: " in_hop || return 1
   if [ "$in_hop" = "1" ]; then
-    read -r -p "起始端口 [20000]: " HOP_START
+    read -r -p "起始端口 [20000]: " HOP_START || return 1
     HOP_START="${HOP_START:-20000}"
-    read -r -p "结束端口 [30000]: " HOP_END
+    read -r -p "结束端口 [30000]: " HOP_END || return 1
     HOP_END="${HOP_END:-30000}"
-    [[ "$HOP_START" =~ ^[0-9]+$ ]] && [[ "$HOP_END" =~ ^[0-9]+$ ]] || { echo "端口必须是数字"; exit 1; }
-    [ "$HOP_START" -lt "$HOP_END" ] || { echo "结束端口必须大于起始端口"; exit 1; }
-    HOP_IFACE="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-    HOP_IFACE="${HOP_IFACE:-eth0}"
+    hy2_validate_hop_range "$HOP_START" "$HOP_END" || return 1
+    HOP_START=$((10#$HOP_START)); HOP_END=$((10#$HOP_END))
+    hy2_require_native_hop || return 1
+    hy2_check_hop_ports "$HOP_START" "$HOP_END" "" || return 1
     HOP=1
+    PORT="$HOP_START"
+    echo "范围监听的主端口为 $PORT；请放行 UDP ${HOP_START}-${HOP_END}。"
   fi
 
-  save_meta
-  write_config
-  write_clients
-  apply_hop
-  restart_svc
+  if ! save_meta || ! write_config || ! write_clients || ! apply_hop || ! restart_svc; then
+    echo "安装或服务启动失败，配置已保留，请检查菜单 7 的日志。"
+    return 1
+  fi
   sleep 1
+  if ! systemctl is-active --quiet hysteria.service; then
+    echo "服务未能正常运行，请检查菜单 7 的日志。"
+    return 1
+  fi
   systemctl --no-pager --full status hysteria.service || true
   echo
   show_info
@@ -385,6 +416,32 @@ get_local_ver() {
   if [ -x "$BIN" ]; then
     "$BIN" version 2>/dev/null | grep -i '^Version' | grep -o 'v[0-9][0-9.]*' | head -1
   fi
+}
+
+# Hysteria 2.8.0 起支持服务端 listen 端口范围，并由内核管理防火墙重定向。
+hy2_require_native_hop() {
+  local version major minor
+  version="$(get_local_ver)"
+  if [[ "$version" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    major=$((10#${BASH_REMATCH[1]})); minor=$((10#${BASH_REMATCH[2]}))
+    if (( major > 2 || (major == 2 && minor >= 8) )); then return 0; fi
+  fi
+  echo "范围监听需要 Hysteria v2.8.0 或更新版本，当前: ${version:-未知}；请先通过菜单 5 更新内核。"
+  return 1
+}
+
+hy2_validate_hop_range() {
+  local start="$1" end="$2"
+  [[ "$start" =~ ^[0-9]{1,5}$ && "$end" =~ ^[0-9]{1,5}$ ]] || { echo "端口必须是 1-65535 的数字"; return 1; }
+  start=$((10#$start)); end=$((10#$end))
+  (( start >= 1 && end <= 65535 && start < end )) || { echo "端口范围须为 1-65535 且结束端口大于起始端口"; return 1; }
+}
+
+hy2_check_hop_ports() {
+  local start="$1" end="$2" old_port="${3:-}" sockets conflict
+  sockets="$(ss -lun)" || { echo "无法检查已占用 UDP 端口"; return 1; }
+  conflict="$(printf '%s\n' "$sockets" | awk -v a="$start" -v b="$end" -v old="$old_port" 'NR>1 {n=split($4,p,":"); v=p[n]; if (v ~ /^[0-9]+$/ && v>=a && v<=b && v != old) {print v; exit}}')"
+  [ -z "$conflict" ] || { echo "UDP 端口 $conflict 已被占用"; return 1; }
 }
 
 get_latest_ver() {
@@ -470,7 +527,11 @@ show_status() {
 }
 
 change_port() {
-  load_meta
+  load_meta || return 1
+  if [ "${HOP:-0}" = 1 ] && [ "$HOP_MODE" = native ]; then
+    echo "范围监听的主端口为范围起始端口，请使用菜单 10 修改端口范围。"
+    return 1
+  fi
   read -r -p "新端口: " PORT
   [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "端口必须是数字"; exit 1; }
   save_meta
@@ -492,54 +553,105 @@ change_bw() {
   restart_svc
   echo "带宽已改为 上 ${UP} / 下 ${DOWN} Mbps"
 }
+# 仅移除本脚本旧版生成的精确 DNAT 规则，不清空其他防火墙配置。
+hy2_remove_legacy_hop() {
+  local iface="$1" start="$2" end="$3" port="$4"
+  [ -n "$iface" ] && [ -n "$start" ] && [ -n "$end" ] || { echo "旧跳跃规则参数不完整，无法安全迁移"; return 1; }
+  iptables -t nat -S PREROUTING >/dev/null || { echo "无法检查旧版 iptables 规则"; return 1; }
+  if iptables -t nat -C PREROUTING -i "$iface" -p udp --dport "${start}:${end}" -j DNAT --to-destination ":${port}" 2>/dev/null; then
+    iptables -t nat -D PREROUTING -i "$iface" -p udp --dport "${start}:${end}" -j DNAT --to-destination ":${port}" || return 1
+  fi
+  if [ -f /etc/systemd/system/ipppp.service ]; then
+    systemctl disable --now ipppp.service || return 1
+  fi
+}
+
 change_hop() {
-  load_meta
-  local old_hop="${HOP:-0}" old_start="${HOP_START:-}" old_end="${HOP_END:-}" old_iface="${HOP_IFACE:-}" old_port="$PORT"
-  if [ "$old_hop" = "1" ]; then
-    echo "当前端口跳跃: 已开启 ${old_start}-${old_end}"
+  local HOP HOP_MODE HOP_START HOP_END HOP_IFACE PORT
+  local old_hop old_mode old_start old_end old_iface old_port default_start default_end op temp stage backup file running=0 ok legacy_touched=0
+  local -a files=(meta.env config.yaml neko.txt hy2.png clash-mate.yaml)
+  load_meta || return 1
+  old_hop="${HOP:-0}"; old_mode="$HOP_MODE"; old_start="${HOP_START:-}"; old_end="${HOP_END:-}"; old_iface="${HOP_IFACE:-}"; old_port="$PORT"
+  if [ "$old_hop" = 1 ]; then
+    echo "当前端口跳跃: ${old_start}-${old_end}（${old_mode}）"
   else
     echo "当前端口跳跃: 未开启"
   fi
-  echo "1 开启或修改"
-  echo "2 关闭"
-  echo "0 返回上级菜单"
-  read -r -p "选择 [回车返回]: " op || return
-
+  echo "1 开启或修改（范围监听）  2 关闭  0 返回上级菜单"
+  read -r -p "选择 [回车返回]: " op || return 1
   case "$op" in
     0|q|Q|'') return 125 ;;
     1)
-      read -r -p "起始端口 [20000]: " HOP_START
-      HOP_START="${HOP_START:-20000}"
-      read -r -p "结束端口 [30000]: " HOP_END
-      HOP_END="${HOP_END:-30000}"
-      [[ "$HOP_START" =~ ^[0-9]+$ ]] && [[ "$HOP_END" =~ ^[0-9]+$ ]] || { echo "端口必须是数字"; exit 1; }
-      [ "$HOP_START" -lt "$HOP_END" ] || { echo "结束端口必须大于起始端口"; exit 1; }
-      HOP_IFACE="$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-      HOP_IFACE="${HOP_IFACE:-eth0}"
-      HOP=1
+      default_start="${old_start:-20000}"; default_end="${old_end:-30000}"
+      read -r -p "起始端口 [$default_start]: " HOP_START || return 1
+      HOP_START="${HOP_START:-$default_start}"
+      read -r -p "结束端口 [$default_end]: " HOP_END || return 1
+      HOP_END="${HOP_END:-$default_end}"
+      hy2_validate_hop_range "$HOP_START" "$HOP_END" || return 1
+      HOP_START=$((10#$HOP_START)); HOP_END=$((10#$HOP_END))
+      hy2_require_native_hop || return 1
+      hy2_check_hop_ports "$HOP_START" "$HOP_END" "$old_port" || return 1
+      HOP=1; HOP_MODE=native; HOP_IFACE=""; PORT="$HOP_START"
+      echo "新主端口为 $PORT，服务端将使用 listen: :${HOP_START}-${HOP_END}。"
       ;;
-    2)
-      HOP=0
-      HOP_START=""
-      HOP_END=""
-      HOP_IFACE=""
-      ;;
-    *)
-      echo "已取消"
-      exit 0
-      ;;
+    2) HOP=0; HOP_MODE=native; HOP_START=""; HOP_END=""; HOP_IFACE="" ;;
+    *) echo "无效选项"; return 1 ;;
   esac
-
-  if [ "$old_hop" = "1" ]; then
-    iptables -t nat -D PREROUTING -i "$old_iface" -p udp --dport "${old_start}:${old_end}" -j DNAT --to-destination ":${old_port}" 2>/dev/null || true
+  umask 077
+  temp="$(mktemp -d "$BASE/.hop.XXXXXXXX")" || return 1
+  stage="$temp/stage"; backup="$temp/backup"
+  mkdir "$stage" "$backup" || { rm -rf "$temp"; return 1; }
+  for file in "${files[@]}"; do
+    if [ -f "$BASE/$file" ]; then
+      cp -p "$BASE/$file" "$backup/$file" || { echo "备份失败"; rm -rf "$temp"; return 1; }
+    fi
+  done
+  if ! ( BASE="$stage"; META="$stage/meta.env"; CFG="$stage/config.yaml"; save_meta && write_config && write_clients ); then
+    echo "生成配置失败，原配置未改变。"; rm -rf "$temp"; return 1
   fi
-
-  save_meta
-  write_clients
-  apply_hop
-  restart_svc
-  sleep 1
-  systemctl is-active --quiet hysteria.service && echo "服务已重启" || echo "服务启动失败，请看菜单 7 的日志"
+  systemctl is-active --quiet hysteria.service && running=1
+  ok=1
+  if [ "$old_hop" = 1 ] && [ "$old_mode" = legacy ]; then
+    legacy_touched=1
+    hy2_remove_legacy_hop "$old_iface" "$old_start" "$old_end" "$old_port" || ok=0
+  fi
+  if [ "$ok" = 1 ]; then
+    for file in "${files[@]}"; do
+      if ! cp -p "$stage/$file" "$BASE/$file"; then ok=0; break; fi
+    done
+  fi
+  if [ "$ok" = 1 ] && [ "$running" = 1 ]; then
+    if systemctl restart hysteria.service; then
+      sleep 1
+      systemctl is-active --quiet hysteria.service || ok=0
+    else
+      ok=0
+    fi
+  fi
+  if [ "$ok" != 1 ]; then
+    echo "应用失败，正在恢复旧配置。"
+    [ "$running" = 0 ] || systemctl stop hysteria.service || true
+    ok=1
+    for file in "${files[@]}"; do
+      if [ -f "$backup/$file" ]; then cp -p "$backup/$file" "$BASE/$file" || ok=0; else rm -f "$BASE/$file" || ok=0; fi
+    done
+    if [ "$legacy_touched" = 1 ]; then
+      ( HOP=1; HOP_MODE=legacy; HOP_IFACE="$old_iface"; HOP_START="$old_start"; HOP_END="$old_end"; PORT="$old_port"; apply_hop ) || ok=0
+    fi
+    if [ "$running" = 1 ]; then
+      systemctl restart hysteria.service && systemctl is-active --quiet hysteria.service || ok=0
+    fi
+    if [ "$ok" = 1 ]; then rm -rf "$temp"; echo "已恢复旧配置。"; else echo "恢复未完全成功，备份保留在 $backup。"; fi
+    return 1
+  fi
+  if [ "$legacy_touched" = 1 ]; then
+    rm -f /etc/systemd/system/ipppp.service "$BASE/ipppp.sh" || echo "警告：旧启动文件清理失败，请手动检查。"
+    systemctl daemon-reload || echo "警告：systemd 配置刷新失败。"
+  fi
+  rm -rf "$temp"
+  if [ "$running" = 1 ]; then echo "配置已更新，服务已重启。"; else echo "配置已更新；服务原本未运行，请按需启动。"; fi
+  if [ "$HOP" = 1 ]; then echo "请在防火墙和云安全组放行 UDP ${HOP_START}-${HOP_END}。"; fi
+  echo "旧客户端需更新端口和链接。"
   show_info
 }
 
@@ -557,49 +669,77 @@ reset_pass() {
 }
 
 switch_obfs() {
-  load_meta
-  if [ "${OBFS_ENABLED:-0}" = "1" ]; then
-    echo "当前 Gecko 混淆: 已开启"
+  local op in_obfs OBFS_ENABLED OBFS_TYPE OBFS old_enabled old_type old_obfs
+  local temp stage backup file running=0 ok
+  local -a files=(meta.env config.yaml neko.txt hy2.png clash-mate.yaml)
+  load_meta || return 1
+  old_enabled="$OBFS_ENABLED"; old_type="$OBFS_TYPE"; old_obfs="${OBFS:-}"
+  if [ "$OBFS_ENABLED" = 1 ]; then
+    echo "当前混淆: $OBFS_TYPE"
   else
-    echo "当前 Gecko 混淆: 已关闭"
+    echo "当前混淆: 关闭"
   fi
-  echo "1 开启或修改 Gecko 混淆"
-  echo "2 关闭 Gecko 混淆"
-  echo "0 返回上级菜单"
-  read -r -p "选择 [回车返回]: " op || return
-
+  echo "1 Gecko  2 Salamander  3 关闭混淆  0 返回上级菜单"
+  read -r -p "选择 [回车返回]: " op || return 1
   case "$op" in
     0|q|Q|'') return 125 ;;
-    1)
-      OBFS_ENABLED=1
-      read -r -p "Gecko 混淆密码 [回车保留当前/随机]: " in_obfs
-      if [ -n "$in_obfs" ]; then
-        OBFS="$in_obfs"
-      elif [ -z "${OBFS:-}" ]; then
-        OBFS="$(randpw)"
-      fi
-      ;;
-    2)
-      OBFS_ENABLED=0
-      ;;
-    *)
-      echo "已取消"
-      return 0
-      ;;
+    1) OBFS_ENABLED=1; OBFS_TYPE=gecko ;;
+    2) OBFS_ENABLED=1; OBFS_TYPE=salamander ;;
+    3) OBFS_ENABLED=0 ;;
+    *) echo "无效选项"; return 1 ;;
   esac
-
-  save_meta
-  write_config
-  write_clients
-  restart_svc
-  sleep 1
-  systemctl is-active --quiet hysteria.service && {
-    if [ "$OBFS_ENABLED" = "1" ]; then
-      echo "混淆已开启"
-    else
-      echo "混淆已关闭"
+  if [ "$OBFS_ENABLED" = 1 ]; then
+    read -r -p "$OBFS_TYPE 混淆密码 [回车保留当前/随机]: " in_obfs || return 1
+    if [ -n "$in_obfs" ]; then OBFS="$in_obfs"; elif [ -z "${OBFS:-}" ]; then OBFS="$(randpw)"; fi
+    [ -n "$OBFS" ] || { echo "随机密码生成失败"; return 1; }
+  fi
+  if [ "$old_enabled" = "$OBFS_ENABLED" ] && [ "$old_type" = "$OBFS_TYPE" ] && [ "$old_obfs" = "${OBFS:-}" ]; then
+    echo "没有修改"; return 0
+  fi
+  umask 077
+  temp="$(mktemp -d "$BASE/.obfs.XXXXXXXX")" || return 1
+  stage="$temp/stage"; backup="$temp/backup"
+  mkdir "$stage" "$backup" || { rm -rf "$temp"; return 1; }
+  for file in "${files[@]}"; do
+    if [ -f "$BASE/$file" ]; then
+      cp -p "$BASE/$file" "$backup/$file" || { echo "备份失败"; rm -rf "$temp"; return 1; }
     fi
-  } || echo "服务启动失败，请看菜单 7 的日志"
+  done
+  if ! ( BASE="$stage"; META="$stage/meta.env"; CFG="$stage/config.yaml"; save_meta && write_config && write_clients ); then
+    echo "生成配置或二维码失败，原配置未改变。"; rm -rf "$temp"; return 1
+  fi
+  systemctl is-active --quiet hysteria.service && running=1
+  ok=1
+  for file in "${files[@]}"; do
+    if ! cp -p "$stage/$file" "$BASE/$file"; then ok=0; break; fi
+  done
+  if [ "$ok" = 1 ] && [ "$running" = 1 ]; then
+    if systemctl restart hysteria.service; then
+      sleep 1
+      systemctl is-active --quiet hysteria.service || ok=0
+    else
+      ok=0
+    fi
+  fi
+  if [ "$ok" != 1 ]; then
+    echo "应用失败，正在恢复旧配置。"
+    ok=1
+    for file in "${files[@]}"; do
+      if [ -f "$backup/$file" ]; then
+        cp -p "$backup/$file" "$BASE/$file" || ok=0
+      else
+        rm -f "$BASE/$file" || ok=0
+      fi
+    done
+    if [ "$running" = 1 ]; then
+      systemctl restart hysteria.service && systemctl is-active --quiet hysteria.service || ok=0
+    fi
+    if [ "$ok" = 1 ]; then rm -rf "$temp"; echo "已恢复旧配置。"; else echo "恢复未完全成功，备份保留在 $backup。"; fi
+    return 1
+  fi
+  rm -rf "$temp"
+  if [ "$running" = 1 ]; then echo "混淆已更新，服务已重启。"; else echo "混淆已更新；服务原本未运行，请按需启动。"; fi
+  echo "客户端必须使用相同混淆类型和密码；旧客户端需更新。"
   show_info
 }
 refresh_ip() {
@@ -743,7 +883,7 @@ while true; do
   echo "12 重新检测公网 IP"
   echo "13 切换自签 / ACME 证书"
   echo "14 IPV6"
-  echo "15 开关 Gecko 混淆"
+  echo "15 切换混淆（Gecko / Salamander / 关闭）"
   echo "16 修改 SNI"
   read -r -p "选择: " choice || return
 
