@@ -207,9 +207,9 @@ write_clients() {
   qrencode -o "$BASE/hy2.png" "$link" || return 1
   bare="${IP//[\[\]]/}"
   # JSON flow mappings are also valid YAML; quoting protects custom passwords and IPv6.
-  python3 - "$bare" "$PORT" "$AUTH" "$SNI" "$CERT_MODE" "${OBFS_ENABLED:-0}" "${OBFS_TYPE:-gecko}" "${OBFS:-}" "${HOP:-0}" "${HOP_MODE:-legacy}" "${HOP_START:-}" "${HOP_END:-}" > "$BASE/clash-mate.yaml" <<'PY'
+  python3 - "$bare" "$PORT" "$AUTH" "$SNI" "$CERT_MODE" "${OBFS_ENABLED:-0}" "${OBFS_TYPE:-gecko}" "${OBFS:-}" "${HOP:-0}" "${HOP_START:-}" "${HOP_END:-}" > "$BASE/clash-mate.yaml" <<'PY'
 import json, sys
-ip, port, password, sni, cert, obfs_on, obfs_type, obfs, hop, hop_mode, start, end = sys.argv[1:]
+ip, port, password, sni, cert, obfs_on, obfs_type, obfs, hop, start, end = sys.argv[1:]
 node = {'name': 'h-delux', 'type': 'hysteria2', 'server': ip, 'port': int(port),
         'password': password, 'alpn': ['h3'], 'sni': sni,
         'skip-cert-verify': cert == 'self'}
@@ -217,8 +217,7 @@ if obfs_on == '1':
     node.update({'obfs': obfs_type, 'obfs-password': obfs})
 node['fast-open'] = True
 if hop == '1':
-    # mihomo uses ports; mport is included for clients using that spelling.
-    node['ports'] = node['mport'] = f'{start}-{end}' if hop_mode == 'native' else f'{port},{start}-{end}'
+    node['ports'] = f'{port},{start}-{end}'
 print('proxies:\n  - ' + json.dumps(node, ensure_ascii=False))
 PY
   [ $? -eq 0 ] || return 1
